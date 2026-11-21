@@ -26,8 +26,10 @@ import {
   parseSitasiData 
 } from './utils/csvParser';
 import { 
+  STORAGE_KEY,
   loadSavedSamples, 
   saveSamples, 
+  saveLocalBackupSnapshot,
   getSavedActivePetugas, 
   saveActivePetugas, 
   calculatePetugasSummaries,
@@ -41,8 +43,13 @@ import {
   exportRekapOnlyToExcel,
   exportRekapToCSV
 } from './utils/export';
-import { formatDateTimeZone, formatShortTimeZone } from './utils/timezone';
-import { postJsonWithRetry, extractErrorMessage } from './utils/api';
+import { formatDateTimeZone } from './utils/timezone';
+import { extractErrorMessage } from './utils/api';
+import {
+  getStoredPermissionConfig,
+  verifyClientAccess,
+  updateClientPermissions,
+} from './utils/auth';
 import {
   getSupabaseClient,
   getIsSupabaseConfigured,
@@ -157,8 +164,7 @@ export default function App() {
   const [isSyncingServer, setIsSyncingServer] = useState<boolean>(false);
   const [lastSavedAt, setLastSavedAt] = useState<string>('');
 
-  // Instant Real-time Synchronization status across devices
-  const [isRealtimeConnected, setIsRealtimeConnected] = useState<boolean>(true);
+  // Instant Real-time Synchronization notice across devices/tabs
   const [realtimeNotice, setRealtimeNotice] = useState<{ message: string; time: string; updater: string } | null>(null);
   const [realtimePulse, setRealtimePulse] = useState<boolean>(false);
 
@@ -205,23 +211,12 @@ export default function App() {
       canEdit: false,
     };
   });
-  const [permissionConfig, setPermissionConfig] = useState<PermissionConfig | null>(null);
+  const [permissionConfig, setPermissionConfig] = useState<PermissionConfig | null>(() =>
+    getStoredPermissionConfig()
+  );
   const [isAccessModalOpen, setIsAccessModalOpen] = useState<boolean>(false);
   const [isBackupRestoreOpen, setIsBackupRestoreOpen] = useState<boolean>(false);
   const [isLoginModalOpen, setIsLoginModalOpen] = useState<boolean>(false);
-
-  // Load permission configuration from server
-  useEffect(() => {
-    fetch('/api/permissions')
-      .then(res => res.json())
-      .then(json => {
-        const cfg = json.data || json.config;
-        if (json.success && cfg) {
-          setPermissionConfig(cfg);
-        }
-      })
-      .catch(() => {});
-  }, []);
 
   // Helper to calculate how many samples have differed from last saved server baseline
   const calculateUnsavedCount = useCallback((currentSamples: SampleItem[], baseline: SampleItem[]) => {
@@ -281,32 +276,7 @@ export default function App() {
         setSupabaseSyncError(getSupabaseConfigStatus().errorMessage);
       }
 
-      // 2. Fallback to Express server /api/samples if Supabase has 0 rows or is unconfigured/offline
-      if (!loadedSamples || loadedSamples.length === 0) {
-        try {
-          const response = await fetch(`/api/samples?_t=${Date.now()}`, {
-            cache: 'no-store',
-            headers: {
-              'Cache-Control': 'no-cache, no-store, must-revalidate',
-              'Pragma': 'no-cache',
-              'Expires': '0',
-            },
-          });
-          if (response.ok) {
-            const json = await response.json();
-            if (json.success && Array.isArray(json.data) && json.data.length > 0) {
-              loadedSamples = json.data;
-              if (!latestUpdatedAt) {
-                latestUpdatedAt = json.updatedAt;
-              }
-            }
-          }
-        } catch (err) {
-          console.warn('Gagal menghubungi server untuk memuat data sampel, menggunakan local storage:', err);
-        }
-      }
-
-      // 3. Fallback to localStorage if server has no samples yet
+      // 2. Fallback to localStorage if Supabase has 0 rows or is not configured yet
       if (!loadedSamples || loadedSamples.length === 0) {
         const saved = loadSavedSamples();
         if (saved && saved.length > 0) {
@@ -314,7 +284,7 @@ export default function App() {
         }
       }
 
-      // 4. Fallback to default CSV file if neither has data
+      // 3. Fallback to default CSV file if neither has data
       if (!loadedSamples || loadedSamples.length === 0) {
         try {
           const response = await fetch('/assets/aistudio/default_samples.csv');
@@ -343,20 +313,7 @@ export default function App() {
         }
       }
 
-      // Load active petugas from server or local
-      try {
-        const pRes = await fetch('/api/active-petugas');
-        if (pRes.ok) {
-          const pJson = await pRes.json();
-          if (pJson.success && pJson.activePetugas) {
-            setActivePetugas(pJson.activePetugas);
-          } else {
-            setActivePetugas(getSavedActivePetugas());
-          }
-        }
-      } catch {
-        setActivePetugas(getSavedActivePetugas());
-      }
+      setActivePetugas(getSavedActivePetugas());
 
       setIsLoading(false);
     };
@@ -410,132 +367,54 @@ export default function App() {
     };
   }, [supabaseReady]);
 
-  // INSTANT REAL-TIME SYNCHRONIZATION VIA SSE (Server-Sent Events)
+  // Cross-tab browser synchronization + periodic Supabase safety-net poll (no Node.js /api required)
   useEffect(() => {
-    let eventSource: EventSource | null = null;
-    let reconnectTimer: any = null;
     let isCleanedUp = false;
 
-    const connectSSE = () => {
-      if (isCleanedUp) return;
+    const handleStorageSync = (e: StorageEvent) => {
+      if (e.key !== STORAGE_KEY || !e.newValue) return;
+      if (unsavedCountRef.current > 0) return;
       try {
-        eventSource = new EventSource('/api/samples/live');
-
-        eventSource.onopen = () => {
-          setIsRealtimeConnected(true);
-        };
-
-        eventSource.addEventListener('connected', () => {
-          setIsRealtimeConnected(true);
-        });
-
-        eventSource.addEventListener('samples_updated', (event: MessageEvent) => {
-          // If Supabase is active, Supabase Realtime + manual/auto fetch takes priority
-          if (getIsSupabaseConfigured()) return;
-          try {
-            const payload = JSON.parse(event.data);
-            if (payload && Array.isArray(payload.samples)) {
-              const incomingSamples: SampleItem[] = payload.samples;
-              const updatedBy = payload.updatedBy || 'Admin/Pemilik';
-              const timeResult = formatDateTimeZone(payload.updatedAt || new Date());
-              const updateTime = timeResult.displayFull;
-
-              if (unsavedCountRef.current === 0) {
-                samplesRef.current = incomingSamples;
-                lastSavedSamplesRef.current = incomingSamples;
-                setSamples(incomingSamples);
-                saveSamples(incomingSamples);
-                setUnsavedCount(0);
-                unsavedCountRef.current = 0;
-                setSyncStatus('synced');
-                setLastSavedAt(updateTime);
-
-                setRealtimePulse(true);
-                setTimeout(() => setRealtimePulse(false), 3000);
-
-                setRealtimeNotice({
-                  message: `Progres monitoring diperbarui oleh ${updatedBy}`,
-                  time: updateTime,
-                  updater: updatedBy,
-                });
-
-                showToast(`⚡ Sinkronisasi Otomatis: Progres baru saja diperbarui oleh ${updatedBy} (${updateTime})!`, 'info');
-              } else {
-                showToast(`ℹ️ Server diperbarui oleh ${updatedBy} (${updateTime}). Simpan perubahan lokal Anda jika ingin memperbarui.`, 'info');
-              }
-            }
-          } catch (parseErr) {
-            console.error('[SSE] Error parsing samples_updated event:', parseErr);
-          }
-        });
-
-        eventSource.onerror = () => {
-          setIsRealtimeConnected(false);
-          eventSource?.close();
-          if (!isCleanedUp) {
-            clearTimeout(reconnectTimer);
-            reconnectTimer = setTimeout(connectSSE, 3000);
-          }
-        };
-      } catch (err) {
-        setIsRealtimeConnected(false);
-        if (!isCleanedUp) {
-          reconnectTimer = setTimeout(connectSSE, 5000);
+        const incomingSamples = JSON.parse(e.newValue);
+        if (Array.isArray(incomingSamples) && incomingSamples.length > 0) {
+          samplesRef.current = incomingSamples;
+          lastSavedSamplesRef.current = incomingSamples;
+          setSamples(incomingSamples);
+          setUnsavedCount(0);
+          unsavedCountRef.current = 0;
+          setSyncStatus('synced');
+          const updateTime = formatDateTimeZone(new Date()).displayFull;
+          setLastSavedAt(updateTime);
+          setRealtimePulse(true);
+          setTimeout(() => setRealtimePulse(false), 2000);
         }
-      }
+      } catch {}
     };
 
-    if (!supabaseReady) {
-      connectSSE();
-    }
+    window.addEventListener('storage', handleStorageSync);
 
-    // Safety-net periodic check every 15s
     const safetyPollInterval = setInterval(async () => {
-      if (unsavedCountRef.current > 0) return;
-      if (getIsSupabaseConfigured()) {
-        try {
-          const supaRes = await fetchSamplesFromSupabase();
-          if (supaRes.success && supaRes.data && supaRes.data.length > 0 && !isCleanedUp) {
-            const currentDigest = lastSavedSamplesRef.current.map((s: any) => `${s.id}:${s.progressStatus}:${s.hasilPendataanFasih || ''}:${s.nusPengganti || ''}:${s.catatanPetugas || ''}`).join('|');
-            const serverDigest = supaRes.data.map((s: any) => `${s.id}:${s.progressStatus}:${s.hasilPendataanFasih || ''}:${s.nusPengganti || ''}:${s.catatanPetugas || ''}`).join('|');
-            if (currentDigest !== serverDigest) {
-              samplesRef.current = supaRes.data;
-              lastSavedSamplesRef.current = supaRes.data;
-              setSamples(supaRes.data);
-              saveSamples(supaRes.data);
-              setUnsavedCount(0);
-              unsavedCountRef.current = 0;
-              setSyncStatus('synced');
-              setSupabaseSyncState('synced');
-              if (supaRes.updatedAt) {
-                setLastSavedAt(formatDateTimeZone(supaRes.updatedAt).displayFull);
-              }
-            }
-          }
-        } catch {}
-        return;
-      }
+      if (unsavedCountRef.current > 0 || !getIsSupabaseConfigured()) return;
       try {
-        const res = await fetch(`/api/samples?_t=${Date.now()}`, {
-          cache: 'no-store',
-          headers: {
-            'Cache-Control': 'no-cache, no-store, must-revalidate',
-            'Pragma': 'no-cache',
-          },
-        });
-        if (res.ok) {
-          const json = await res.json();
-          if (json.success && Array.isArray(json.data) && json.data.length > 0 && !isCleanedUp) {
-            const currentDigest = lastSavedSamplesRef.current.map((s: any) => `${s.id}:${s.progressStatus}:${s.hasilPendataanFasih || ''}:${s.nusPengganti || ''}:${s.catatanPetugas || ''}`).join('|');
-            const serverDigest = json.data.map((s: any) => `${s.id}:${s.progressStatus}:${s.hasilPendataanFasih || ''}:${s.nusPengganti || ''}:${s.catatanPetugas || ''}`).join('|');
-            if (currentDigest !== serverDigest) {
-              samplesRef.current = json.data;
-              lastSavedSamplesRef.current = json.data;
-              setSamples(json.data);
-              saveSamples(json.data);
-              setUnsavedCount(0);
-              unsavedCountRef.current = 0;
-              setSyncStatus('synced');
+        const supaRes = await fetchSamplesFromSupabase();
+        if (supaRes.success && supaRes.data && supaRes.data.length > 0 && !isCleanedUp) {
+          const currentDigest = lastSavedSamplesRef.current
+            .map((s: any) => `${s.id}:${s.progressStatus}:${s.hasilPendataanFasih || ''}:${s.nusPengganti || ''}:${s.catatanPetugas || ''}`)
+            .join('|');
+          const serverDigest = supaRes.data
+            .map((s: any) => `${s.id}:${s.progressStatus}:${s.hasilPendataanFasih || ''}:${s.nusPengganti || ''}:${s.catatanPetugas || ''}`)
+            .join('|');
+          if (currentDigest !== serverDigest) {
+            samplesRef.current = supaRes.data;
+            lastSavedSamplesRef.current = supaRes.data;
+            setSamples(supaRes.data);
+            saveSamples(supaRes.data);
+            setUnsavedCount(0);
+            unsavedCountRef.current = 0;
+            setSyncStatus('synced');
+            setSupabaseSyncState('synced');
+            if (supaRes.updatedAt) {
+              setLastSavedAt(formatDateTimeZone(supaRes.updatedAt).displayFull);
             }
           }
         }
@@ -544,15 +423,12 @@ export default function App() {
 
     return () => {
       isCleanedUp = true;
-      clearTimeout(reconnectTimer);
+      window.removeEventListener('storage', handleStorageSync);
       clearInterval(safetyPollInterval);
-      if (eventSource) {
-        eventSource.close();
-      }
     };
-  }, [showToast, supabaseReady]);
+  }, [supabaseReady]);
 
-  // MANUAL SAVE TO SUPABASE & SERVER:
+  // MANUAL SAVE TO SUPABASE & LOCAL STORAGE + DEVICE BACKUP (100% Client-Side, no Node.js required):
   const handleManualSaveToServer = useCallback(async () => {
     if (!authSession.canEdit) {
       showToast('Akses ditolak: Hanya Akun Pemilik atau akun dengan izin edit yang dapat menyimpan perubahan!', 'error');
@@ -568,6 +444,8 @@ export default function App() {
     }
 
     try {
+      let savedTimestamp: string = new Date().toISOString();
+
       // 1. Sync full dataset to Supabase when configured
       if (getIsSupabaseConfigured()) {
         const supaSaveRes = await upsertSamplesBatchToSupabase(samples);
@@ -576,126 +454,98 @@ export default function App() {
           setSupabaseSyncError(supaSaveRes.error || 'Gagal menyimpan ke Supabase.');
           setSyncStatus('offline');
           showToast(`Gagal menyimpan ke Supabase: ${supaSaveRes.error}`, 'error');
-          setIsSavingToServer(false);
           return;
+        }
+        if (supaSaveRes.updatedAt) {
+          savedTimestamp = supaSaveRes.updatedAt;
         }
         setSupabaseSyncState('synced');
         setSupabaseSyncError(null);
       }
 
-      // 2. Also persist to Express backup endpoint
-      const res = await fetch('/api/samples', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-auth-role': authSession.role,
-          'x-auth-token': authSession.token || '',
-          'x-auth-email': authSession.email || '',
-        },
-        body: JSON.stringify({
-          samples,
-          role: authSession.role,
-          token: authSession.token,
-          email: authSession.email,
-        }),
-      });
+      // 2. Always persist to browser localStorage & snapshot history
+      saveSamples(samples);
+      saveLocalBackupSnapshot(samples);
 
-      let json: Record<string, any> | null = null;
+      lastSavedSamplesRef.current = samples;
+      setUnsavedCount(0);
+      unsavedCountRef.current = 0;
+      setSyncStatus('synced');
+      const timeResult = formatDateTimeZone(savedTimestamp);
+      setLastSavedAt(timeResult.displayFull);
+
+      const targetLabel = getIsSupabaseConfigured() ? 'Supabase & browser' : 'penyimpanan lokal & snapshot browser';
+
+      // Otomatis Simpan Backup ke Internal Device (dengan dialog memilih folder/lokasi file)
       try {
-        const rawText = await res.text();
-        json = rawText ? JSON.parse(rawText) : null;
-      } catch {
-        json = null;
-      }
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const defaultFilename = `Backup_SITASI_2026_${timestamp}.json`;
+        const backupPayload = {
+          version: '1.0',
+          exportedAt: timeResult.isoString,
+          exportedAtWIB: timeResult.primaryWIB,
+          exportedAtLocal: timeResult.localTime,
+          totalSamples: samples.length,
+          source: 'Otomatis saat Klik Simpan Perubahan',
+          samples,
+        };
+        const jsonStr = JSON.stringify(backupPayload, null, 2);
 
-      if ((res.ok && json?.success) || getIsSupabaseConfigured()) {
-        lastSavedSamplesRef.current = samples;
-        setUnsavedCount(0);
-        unsavedCountRef.current = 0;
-        setSyncStatus('synced');
-        const timeResult = formatDateTimeZone((res.ok && json?.updatedAt) || new Date());
-        setLastSavedAt(timeResult.displayFull);
-
-        // Otomatis Simpan Backup ke Internal Device (dengan dialog memilih folder/lokasi file)
-        try {
-          const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-          const defaultFilename = `Backup_SITASI_2026_${timestamp}.json`;
-          const backupPayload = {
-            version: '1.0',
-            exportedAt: timeResult.isoString,
-            exportedAtWIB: timeResult.primaryWIB,
-            exportedAtLocal: timeResult.localTime,
-            totalSamples: samples.length,
-            source: 'Otomatis saat Klik Simpan Perubahan',
-            samples,
-          };
-          const jsonStr = JSON.stringify(backupPayload, null, 2);
-
-          if ('showSaveFilePicker' in window) {
-            try {
-              const handle = await (window as any).showSaveFilePicker({
-                suggestedName: defaultFilename,
-                types: [{
-                  description: 'File Backup Data SITASI 2026 (.json)',
-                  accept: { 'application/json': ['.json'] }
-                }]
-              });
-              const writable = await handle.createWritable();
-              await writable.write(jsonStr);
-              await writable.close();
-              showToast(`✅ Perubahan disimpan ke server & backup berhasil disimpan ke folder di device Anda! (${defaultFilename})`, 'success');
-            } catch (pickerErr: any) {
-              if (pickerErr.name === 'AbortError') {
-                showToast(`✅ Perubahan disimpan permanen ke server & snapshot otomatis dibuat. (Pemilihan folder backup dibatalkan)`, 'info');
-              } else {
-                // Fallback auto download
-                const blob = new Blob([jsonStr], { type: 'application/json' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = defaultFilename;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                URL.revokeObjectURL(url);
-                showToast(`✅ Perubahan disimpan ke server & file backup otomatis terunduh ke internal device (${defaultFilename}).`, 'success');
-              }
+        if ('showSaveFilePicker' in window) {
+          try {
+            const handle = await (window as any).showSaveFilePicker({
+              suggestedName: defaultFilename,
+              types: [{
+                description: 'File Backup Data SITASI 2026 (.json)',
+                accept: { 'application/json': ['.json'] }
+              }]
+            });
+            const writable = await handle.createWritable();
+            await writable.write(jsonStr);
+            await writable.close();
+            showToast(`✅ Perubahan disimpan ke ${targetLabel} & backup berhasil disimpan ke device Anda! (${defaultFilename})`, 'success');
+          } catch (pickerErr: any) {
+            if (pickerErr.name === 'AbortError') {
+              showToast(`✅ Perubahan disimpan permanen ke ${targetLabel}. (Pemilihan folder backup device dibatalkan)`, 'info');
+            } else {
+              const blob = new Blob([jsonStr], { type: 'application/json' });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = defaultFilename;
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              URL.revokeObjectURL(url);
+              showToast(`✅ Perubahan disimpan ke ${targetLabel} & file backup terunduh (${defaultFilename}).`, 'success');
             }
-          } else {
-            // Fallback for browsers without showSaveFilePicker
-            const blob = new Blob([jsonStr], { type: 'application/json' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = defaultFilename;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-            showToast(`✅ Perubahan disimpan ke server & file backup otomatis terunduh ke internal device (${defaultFilename}).`, 'success');
           }
-        } catch (deviceSaveErr) {
-          console.warn('Auto backup to device error:', deviceSaveErr);
-          showToast(`✅ Berhasil! Perubahan (${samples.length} sampel) telah disimpan permanen ke server.`, 'success');
+        } else {
+          const blob = new Blob([jsonStr], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = defaultFilename;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+          showToast(`✅ Perubahan disimpan ke ${targetLabel} & file backup terunduh (${defaultFilename}).`, 'success');
         }
-      } else {
-        setSyncStatus('offline');
-        const errMsg =
-          res.status === 404
-            ? 'Endpoint penyimpanan server (/api/samples) belum aktif di tautan ini (HTTP 404). Aktifkan Supabase atau buka melalui server full-stack.'
-            : extractErrorMessage(json?.error ?? json?.message ?? json, 'Akses ditolak atau server bermasalah');
-        showToast(`Gagal menyimpan ke server: ${errMsg}`, 'error');
+      } catch (deviceSaveErr) {
+        console.warn('Auto backup to device error:', deviceSaveErr);
+        showToast(`✅ Berhasil! Perubahan (${samples.length} sampel) telah disimpan ke ${targetLabel}.`, 'success');
       }
     } catch (err) {
-      console.error('Error saving to server:', err);
+      console.error('Error saving samples:', err);
       setSyncStatus('offline');
-      showToast('Gagal terhubung ke server. Perubahan tetap tersimpan di memori browser ini.', 'error');
+      showToast(`Gagal menyimpan perubahan: ${extractErrorMessage(err, 'Terjadi kesalahan sistem.')}`, 'error');
     } finally {
       setIsSavingToServer(false);
     }
   }, [authSession, samples, showToast]);
 
-  // SINKRONKAN ULANG / REFRESH DATA DARI SUPABASE (atau server fallback)
+  // SINKRONKAN ULANG / REFRESH DATA DARI SUPABASE (atau muat ulang dari penyimpanan lokal browser)
   const handleRefreshFromSupabase = useCallback(async () => {
     setIsRefreshingSupabase(true);
     setIsSyncingServer(true);
@@ -738,42 +588,23 @@ export default function App() {
         return;
       }
 
-      const bustCacheUrl = `/api/samples?_t=${Date.now()}`;
-      const res = await fetch(bustCacheUrl, {
-        method: 'GET',
-        cache: 'no-store',
-        headers: {
-          'Cache-Control': 'no-cache, no-store, must-revalidate',
-          'Pragma': 'no-cache',
-          'Expires': '0',
-        },
-      });
-
-      if (res.ok) {
-        const json = await res.json();
-        if (json.success && Array.isArray(json.data) && json.data.length > 0) {
-          const incoming: SampleItem[] = json.data;
-          const completedCount = incoming.filter(s => isSampleBerhasil(s)).length;
-
-          samplesRef.current = incoming;
-          lastSavedSamplesRef.current = incoming;
-          setSamples(incoming);
-          saveSamples(incoming);
-          setUnsavedCount(0);
-          unsavedCountRef.current = 0;
-          setSyncStatus('synced');
-
-          const timeInfo = formatDateTimeZone(json.updatedAt || new Date());
-          setLastSavedAt(timeInfo.displayFull);
-
-          setRealtimePulse(true);
-          setTimeout(() => setRealtimePulse(false), 2000);
-
-          showToast(`✅ Data terbaru berhasil dimuat (${completedCount} selesai dicacah) [${timeInfo.displayFull}].`, 'success');
-          return;
-        }
+      const localSaved = loadSavedSamples();
+      if (localSaved && localSaved.length > 0) {
+        const completedCount = localSaved.filter(s => isSampleBerhasil(s)).length;
+        samplesRef.current = localSaved;
+        lastSavedSamplesRef.current = localSaved;
+        setSamples(localSaved);
+        setUnsavedCount(0);
+        unsavedCountRef.current = 0;
+        setSyncStatus('synced');
+        const timeInfo = formatDateTimeZone(new Date());
+        setLastSavedAt(timeInfo.displayFull);
+        setRealtimePulse(true);
+        setTimeout(() => setRealtimePulse(false), 2000);
+        showToast(`✅ Data dimuat ulang dari penyimpanan lokal browser (${localSaved.length} sampel, ${completedCount} selesai).`, 'success');
+      } else {
+        showToast('Belum ada data tersimpan lokal dan Supabase belum dikonfigurasi.', 'info');
       }
-      showToast('Belum ada data tersimpan atau Supabase belum dikonfigurasi.', 'info');
     } catch (err: any) {
       console.error('Error refreshing data:', err);
       const safeErr = extractErrorMessage(err, 'Gagal terhubung ke Supabase.');
@@ -788,9 +619,13 @@ export default function App() {
     }
   }, [showToast]);
 
-  // Handler untuk Restore Data dari File atau Server Snapshot
+  // Handler untuk Restore Data dari File atau Snapshot Browser
   const handleRestoreSamples = useCallback(async (restored: SampleItem[], sourceLabel: string) => {
     try {
+      if (samplesRef.current.length > 0) {
+        saveLocalBackupSnapshot(samplesRef.current, 'Sebelum_Restore');
+      }
+
       if (getIsSupabaseConfigured()) {
         setSupabaseSyncState('saving');
         const supaRes = await replaceAllSamplesInSupabase(restored);
@@ -807,38 +642,25 @@ export default function App() {
       samplesRef.current = restored;
       setSamples(restored);
       saveSamples(restored);
+      saveLocalBackupSnapshot(restored, 'Hasil_Restore');
       lastSavedSamplesRef.current = restored;
       setUnsavedCount(0);
       unsavedCountRef.current = 0;
 
-      // Sync restored samples to local server backup as well
-      await fetch('/api/samples', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-auth-role': authSession.role,
-          'x-auth-token': authSession.token || '',
-          'x-auth-email': authSession.email || '',
-        },
-        body: JSON.stringify({
-          samples: restored,
-          role: authSession.role,
-          token: authSession.token,
-          email: authSession.email,
-        }),
-      }).catch(() => {});
-
       setSyncStatus('synced');
       const timeInfo = formatDateTimeZone(new Date());
       setLastSavedAt(timeInfo.displayFull);
-      showToast(`✅ Berhasil merestore ${restored.length} sampel dari "${sourceLabel}" & disinkronkan ke ${getIsSupabaseConfigured() ? 'Supabase' : 'server'} (${timeInfo.displayFull}).`, 'success');
+      showToast(
+        `✅ Berhasil merestore ${restored.length} sampel dari "${sourceLabel}" & disimpan ke ${getIsSupabaseConfigured() ? 'Supabase & lokal browser' : 'penyimpanan lokal browser'} (${timeInfo.displayFull}).`,
+        'success'
+      );
       return true;
     } catch (err) {
       console.error('Error restoring samples:', err);
-      showToast('Gagal menyinkronkan data hasil restore.', 'error');
+      showToast(`Gagal menyinkronkan data hasil restore: ${extractErrorMessage(err, 'Kesalahan penyimpanan')}`, 'error');
       return false;
     }
-  }, [authSession, showToast]);
+  }, [showToast]);
 
   // Direct Mutation Sync Helper:
   // Memperbarui UI seketika dan langsung menjalankan UPDATE / UPSERT / DELETE ke Supabase (bila terkonfigurasi)
@@ -914,93 +736,33 @@ export default function App() {
       setUnsavedCount(diffs);
       unsavedCountRef.current = diffs;
       if (toastMsg) {
-        showToast(`${toastMsg}${getIsSupabaseConfigured() ? '' : " (Klik 'Simpan Perubahan' untuk simpan ke server)"}`, 'info');
+        showToast(`${toastMsg}${getIsSupabaseConfigured() ? '' : " (Klik 'Simpan Perubahan' untuk simpan & buat backup)"}`, 'info');
       }
     },
     [calculateUnsavedCount, showToast]
   );
 
-  // Auth & Permissions Handlers
+  // Auth & Permissions Handlers (100% Client-Side, zero dependency on Node.js /api)
   const handleLoginAccess = async (keyOrPin: string, email?: string) => {
-    const res = await postJsonWithRetry('/api/permissions/verify', { keyOrPin, email }, { retries: 2, timeoutMs: 10000 });
-    const json = res.data;
-    const trimmedEmail = String(email || '').trim().toLowerCase();
-    const configuredOwnerEmail = String(permissionConfig?.ownerEmail || 'sifarofatunnisa24@gmail.com').toLowerCase();
+    const result = await verifyClientAccess(keyOrPin, email);
 
-    // If backend /api/* returns 404 (e.g., static preview / Share URL before full-stack republish):
-    // - Non-owner Google accounts still get clean Read-Only ('guest') access without crashing or failing with [404].
-    // - Owner account receives a clear actionable message instead of cryptic "[404] The page could not be found".
-    if (res.status === 404) {
-      if (trimmedEmail && trimmedEmail !== configuredOwnerEmail) {
-        const guestMsg = `Berhasil login dengan akun Google ${trimmedEmail}. Anda memiliki akses Melihat data (Hanya Lihat).`;
-        const guestSession: UserAuthSession = {
-          role: 'guest',
-          email: trimmedEmail,
-          displayName: trimmedEmail,
-          token: `guest_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
-          canEdit: false,
-          loginAt: new Date().toISOString(),
-        };
-        setAuthSession(guestSession);
-        try {
-          localStorage.setItem('sitasi_auth_session', JSON.stringify(guestSession));
-        } catch {}
-        showToast(guestMsg, 'success');
-        return { success: true, message: guestMsg };
-      }
-
-      return {
-        success: false,
-        message:
-          'Server autentikasi (/api/permissions/verify) tidak ditemukan (HTTP 404). Tautan pratinjau statis tidak menjalankan backend Node.js — silakan buka melalui Development App URL atau lakukan Share/Publish ulang aplikasi.',
-      };
-    }
-
-    if (!json) {
-      return {
-        success: false,
-        message: res.networkError
-          ? `Gagal menghubungi server autentikasi (${extractErrorMessage(res.networkError, 'Koneksi terganggu')})`
-          : 'Gagal menghubungi server autentikasi.',
-      };
-    }
-
-    if (json.success) {
-      const isOwnerRole = json.role === 'owner';
-      const safeEmail = typeof json.email === 'string' && json.email ? json.email : email;
-      const safeDisplayName =
-        typeof json.displayName === 'string' && json.displayName
-          ? json.displayName
-          : isOwnerRole
-          ? 'Pemilik (sifarofatunnisa24@gmail.com)'
-          : safeEmail || 'Pengguna Google';
-      const safeSuccessMsg = extractErrorMessage(json.message, 'Login berhasil!');
-
-      const session: UserAuthSession = {
-        role: json.role === 'owner' || json.role === 'editor' || json.role === 'guest' ? json.role : 'guest',
-        email: safeEmail,
-        displayName: safeDisplayName,
-        token: typeof json.token === 'string' ? json.token : undefined,
-        canEdit: isOwnerRole || json.role === 'editor',
-        loginAt: new Date().toISOString(),
-      };
-      setAuthSession(session);
+    if (result.success && result.session) {
+      setAuthSession(result.session);
       try {
-        localStorage.setItem('sitasi_auth_session', JSON.stringify(session));
+        localStorage.setItem('sitasi_auth_session', JSON.stringify(result.session));
       } catch {
-        // If localStorage quota is full from large sample cache, clear sample cache and retry persisting auth session
         try {
-          localStorage.removeItem('sitasi_2026_monitoring_samples_v1');
-          localStorage.setItem('sitasi_auth_session', JSON.stringify(session));
+          localStorage.removeItem(STORAGE_KEY);
+          localStorage.setItem('sitasi_auth_session', JSON.stringify(result.session));
         } catch {}
       }
-      showToast(safeSuccessMsg, 'success');
-      return { success: true, message: safeSuccessMsg };
+      showToast(result.message, 'success');
+      return { success: true, message: result.message };
     }
 
     return {
       success: false,
-      message: extractErrorMessage(json.error ?? json.message ?? json, 'Gagal login akun Google.'),
+      message: extractErrorMessage(result.message, 'Gagal login akun Google.'),
     };
   };
 
@@ -1030,32 +792,17 @@ export default function App() {
     allowedEmails?: string[];
     allowedPetugas?: string[];
   }) => {
-    const res = await postJsonWithRetry('/api/permissions/update', {
-      ...updated,
-      role: authSession.role,
-      token: authSession.token,
-    });
-    const json = res.data;
+    const result = await updateClientPermissions(updated);
 
-    if (!json) {
-      return {
-        success: false,
-        message: res.networkError
-          ? `Gagal menghubungi server pengaturan izin (${extractErrorMessage(res.networkError, 'Koneksi terganggu')})`
-          : 'Gagal menghubungi server pengaturan izin.',
-      };
-    }
-
-    if (json.success) {
-      setPermissionConfig(json.data || json.config);
-      const okMsg = extractErrorMessage(json.message, 'Pengaturan hak akses berhasil diperbarui!');
-      showToast(okMsg, 'success');
-      return { success: true, message: okMsg };
+    if (result.success && result.config) {
+      setPermissionConfig(result.config);
+      showToast(result.message, 'success');
+      return { success: true, message: result.message };
     }
 
     return {
       success: false,
-      message: extractErrorMessage(json.error ?? json.message ?? json, 'Gagal memperbarui izin'),
+      message: extractErrorMessage(result.message, 'Gagal memperbarui izin.'),
     };
   };
 
@@ -1431,15 +1178,10 @@ export default function App() {
     setSelectedIds(new Set());
   };
 
-  // Switch officer with server synchronization
+  // Switch officer
   const handleSelectPetugas = (petugas: string) => {
     setActivePetugas(petugas);
     saveActivePetugas(petugas);
-    fetch('/api/active-petugas', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ activePetugas: petugas }),
-    }).catch(() => {});
     setSelectedIds(new Set());
   };
 
@@ -1447,21 +1189,22 @@ export default function App() {
   const handleAddDemoOfficers = () => {
     const demo = generateDemoAdditionalOfficers();
     updateSamplesState(prev => {
-      // Filter out existing ones with same id
       const existingIds = new Set(prev.map(p => p.id));
       const filteredDemo = demo.filter(d => !existingIds.has(d.id));
       return [...prev, ...filteredDemo];
     }, 'Berhasil menambahkan data simulasi petugas (Budi Pratama & Siti Nurhaliza)!');
   };
 
-  // Reset to default with Supabase & server reset
+  // Reset to default Erika CSV + Supabase reset
   const handleResetData = async () => {
     if (window.confirm('Apakah Anda yakin ingin memuat ulang data awal dari file Excel/CSV Erika? Perubahan checklist yang tersimpan akan dikembalikan ke awal.')) {
-      localStorage.removeItem('sitasi_2026_monitoring_samples_v1');
+      if (samplesRef.current.length > 0) {
+        saveLocalBackupSnapshot(samplesRef.current, 'Sebelum_Reset');
+      }
+      localStorage.removeItem(STORAGE_KEY);
       localStorage.removeItem('sitasi_2026_active_petugas');
       setIsLoading(true);
       try {
-        await fetch('/api/reset-data', { method: 'POST' }).catch(() => {});
         const response = await fetch('/assets/aistudio/Sampel_SITASI_2026_-_Erika_b0fbe93c.csv');
         const text = await response.text();
         const rows = parseCSV(text);
@@ -1491,18 +1234,10 @@ export default function App() {
         setSelectedIds(new Set());
         setLastSavedAt(formatDateTimeZone(new Date()).displayFull);
 
-        // Seed Express backup as well
-        await fetch('/api/samples', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-auth-role': authSession.role,
-            'x-auth-token': authSession.token || '',
-            'x-auth-email': authSession.email || '',
-          },
-          body: JSON.stringify({ samples: parsed, role: authSession.role, token: authSession.token, email: authSession.email }),
-        }).catch(() => {});
-        showToast(`Data berhasil dikembalikan ke sampel default Erika dan disinkronkan ke ${getIsSupabaseConfigured() ? 'Supabase' : 'server'}.`, 'info');
+        showToast(
+          `Data berhasil dikembalikan ke sampel default Erika dan disimpan ke ${getIsSupabaseConfigured() ? 'Supabase & lokal browser' : 'penyimpanan lokal browser'}.`,
+          'info'
+        );
       } catch (err) {
         console.error('Reset error:', err);
       } finally {
@@ -1520,7 +1255,6 @@ export default function App() {
       const isUtama = target.statusSampel === 'U';
 
       return prev.map(s => {
-        // Clear target sample's pengganti
         if (s.id === id) {
           return {
             ...s,
@@ -1528,7 +1262,6 @@ export default function App() {
             updatedAt: new Date().toISOString(),
           };
         }
-        // If target was Utama and referenced a Cadangan, also clear that Cadangan's reference
         if (isUtama && oldPenggantiNus && s.statusSampel === 'C' && s.nus === oldPenggantiNus && s.nks === target.nks) {
           if (s.nusPengganti === target.nus) {
             return {
@@ -1538,7 +1271,6 @@ export default function App() {
             };
           }
         }
-        // If target was Cadangan and replaced an Utama, clear that Utama's reference too
         if (!isUtama && oldPenggantiNus && s.statusSampel === 'U' && s.nus === oldPenggantiNus && s.nks === target.nks) {
           if (s.nusPengganti === target.nus) {
             return {
@@ -1550,7 +1282,7 @@ export default function App() {
         }
         return s;
       });
-    }, 'NUS Pengganti berhasil dihapus dan disimpan ke server.');
+    }, 'NUS Pengganti berhasil dihapus.');
   }, []);
 
   // One-click Clear / Hapus Catatan Petugas
@@ -1777,7 +1509,7 @@ export default function App() {
                   Konfigurasi Supabase Belum Lengkap ({getSupabaseConfigStatus().errorMessage})
                 </p>
                 <p className="text-amber-900 leading-relaxed">
-                  Untuk mengaktifkan database utama Supabase secara permanen: tambahkan <code className="bg-amber-100 px-1 py-0.5 rounded font-mono">VITE_SUPABASE_URL</code> dan <code className="bg-amber-100 px-1 py-0.5 rounded font-mono">VITE_SUPABASE_ANON_KEY</code> pada environment variables / Secrets, lalu jalankan skrip <code className="bg-amber-100 px-1 py-0.5 rounded font-mono">supabase_schema.sql</code> di SQL Editor Supabase. Dashboard tetap berjalan aman menggunakan penyimpanan cadangan lokal/server.
+                  Untuk mengaktifkan database utama Supabase secara permanen: tambahkan <code className="bg-amber-100 px-1 py-0.5 rounded font-mono">VITE_SUPABASE_URL</code> dan <code className="bg-amber-100 px-1 py-0.5 rounded font-mono">VITE_SUPABASE_ANON_KEY</code> pada environment variables / Secrets, lalu jalankan skrip <code className="bg-amber-100 px-1 py-0.5 rounded font-mono">supabase_schema.sql</code> di SQL Editor Supabase. Dashboard tetap berjalan aman menggunakan penyimpanan lokal browser.
                 </p>
               </div>
             </div>
@@ -1854,7 +1586,7 @@ export default function App() {
                   ) : getIsSupabaseConfigured() ? (
                     '🟢 Tersinkron ke Supabase'
                   ) : syncStatus === 'synced' ? (
-                    '🟢 Seluruh data tersimpan di server lokal'
+                    '🟢 Seluruh data tersimpan di penyimpanan lokal'
                   ) : (
                     '⚪ Mode Offline (Tersimpan Lokal)'
                   )}

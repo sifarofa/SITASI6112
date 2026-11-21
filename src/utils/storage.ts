@@ -1,8 +1,17 @@
 import { SampleItem, PetugasSummary, VisibleColumns, DEFAULT_VISIBLE_COLUMNS } from '../types/sitasi';
 
-const STORAGE_KEY = 'sitasi_2026_monitoring_samples_v1';
+export const STORAGE_KEY = 'sitasi_2026_monitoring_samples_v1';
 const ACTIVE_PETUGAS_KEY = 'sitasi_2026_active_petugas';
 const VISIBLE_COLUMNS_KEY = 'sitasi_2026_visible_columns';
+const LOCAL_BACKUPS_KEY = 'sitasi_2026_local_backups_v1';
+
+export interface LocalBackupSnapshot {
+  fileName: string;
+  sizeBytes: number;
+  createdAt: string;
+  sampleCount: number;
+  samples: SampleItem[];
+}
 
 /**
  * Load visible columns configuration or fallback to default
@@ -56,6 +65,59 @@ export function saveSamples(samples: SampleItem[]): void {
   } catch (err) {
     console.error('Error saving samples to storage:', err);
   }
+}
+
+/**
+ * Load local backup snapshots stored in browser localStorage
+ */
+export function loadLocalBackupSnapshots(): LocalBackupSnapshot[] {
+  try {
+    const raw = localStorage.getItem(LOCAL_BACKUPS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return parsed.filter(
+        (item) => item && typeof item.fileName === 'string' && Array.isArray(item.samples)
+      );
+    }
+  } catch {}
+  return [];
+}
+
+/**
+ * Save a timestamped backup snapshot in browser localStorage (keeps newest snapshots safely within quota)
+ */
+export function saveLocalBackupSnapshot(
+  samples: SampleItem[],
+  prefix = 'Backup_SITASI_2026'
+): LocalBackupSnapshot | null {
+  if (!Array.isArray(samples) || samples.length === 0) return null;
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const timeStr = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+  const fileName = `${prefix}_${timeStr}.json`;
+  const serializedSamples = JSON.stringify(samples);
+  const snapshot: LocalBackupSnapshot = {
+    fileName,
+    sizeBytes: serializedSamples.length,
+    createdAt: now.toISOString(),
+    sampleCount: samples.length,
+    samples,
+  };
+
+  const existing = loadLocalBackupSnapshots();
+  const candidates = [snapshot, ...existing].slice(0, 6);
+
+  while (candidates.length > 0) {
+    try {
+      localStorage.setItem(LOCAL_BACKUPS_KEY, JSON.stringify(candidates));
+      return snapshot;
+    } catch {
+      candidates.pop();
+    }
+  }
+
+  return null;
 }
 
 /**

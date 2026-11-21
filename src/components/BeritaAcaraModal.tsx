@@ -121,35 +121,19 @@ export const BeritaAcaraModal: React.FC<BeritaAcaraModalProps> = ({
     return krt || sample.namaUTP || '';
   };
 
-  // Load saved template config from server (/api/berita-acara) or localStorage
+  // Load saved template config from localStorage
   useEffect(() => {
     if (!isOpen) return;
-    const loadConfig = async () => {
+    const loadConfig = () => {
       let loadedConfig: SavedTemplateConfig | null = null;
 
-      // 1. Try server first for cross-device synchronization
       try {
-        const res = await fetch('/api/berita-acara');
-        if (res.ok) {
-          const json = await res.json();
-          if (json.success && json.data) {
-            loadedConfig = json.data;
-          }
+        const raw = localStorage.getItem(TEMPLATE_STORAGE_KEY);
+        if (raw) {
+          loadedConfig = JSON.parse(raw);
         }
-      } catch (err) {
-        console.warn('Could not fetch berita acara from server, falling back to local storage:', err);
-      }
-
-      // 2. Fallback to localStorage if server didn't have it
-      if (!loadedConfig) {
-        try {
-          const raw = localStorage.getItem(TEMPLATE_STORAGE_KEY);
-          if (raw) {
-            loadedConfig = JSON.parse(raw);
-          }
-        } catch (e) {
-          console.error('Failed to parse saved berita acara config:', e);
-        }
+      } catch (e) {
+        console.error('Failed to parse saved berita acara config:', e);
       }
 
       if (loadedConfig) {
@@ -246,8 +230,8 @@ export const BeritaAcaraModal: React.FC<BeritaAcaraModalProps> = ({
     loadConfig();
   }, [isOpen, samples, utamaSamples, cadanganSamples]);
 
-  // Save template configuration to localStorage and server
-  const handleSaveTemplateConfig = async () => {
+  // Save template configuration to localStorage
+  const handleSaveTemplateConfig = () => {
     try {
       const configToSave: SavedTemplateConfig = {
         judulBeritaAcara,
@@ -265,21 +249,9 @@ export const BeritaAcaraModal: React.FC<BeritaAcaraModalProps> = ({
         pejabatJabatan,
         savedCustomRows: rows,
       };
-      // Local backup
       localStorage.setItem(TEMPLATE_STORAGE_KEY, JSON.stringify(configToSave));
 
-      // Server persistence for cross-device access
-      try {
-        await fetch('/api/berita-acara', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(configToSave),
-        });
-      } catch (serverErr) {
-        console.warn('Failed to save berita acara to server:', serverErr);
-      }
-
-      setSaveSuccessMsg('Template dan perubahan Berita Acara berhasil disimpan ke Server & Browser!');
+      setSaveSuccessMsg('Template dan perubahan Berita Acara berhasil disimpan!');
       setTimeout(() => setSaveSuccessMsg(null), 3000);
     } catch (err) {
       console.error('Error saving template:', err);

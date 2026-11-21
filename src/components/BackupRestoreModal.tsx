@@ -22,13 +22,19 @@ import {
   mapFasihToSurveyStatus,
   mapSurveyStatusToFasih,
 } from '../types/sitasi';
-import { extractErrorMessage, postJsonWithRetry } from '../utils/api';
+import { extractErrorMessage } from '../utils/api';
+import {
+  LocalBackupSnapshot,
+  loadLocalBackupSnapshots,
+  saveLocalBackupSnapshot,
+} from '../utils/storage';
 
-interface ServerBackupItem {
+interface BackupItem {
   fileName: string;
   sizeBytes: number;
   createdAt: string;
   sampleCount: number;
+  samples: SampleItem[];
 }
 
 interface BackupRestoreModalProps {
@@ -203,8 +209,8 @@ export const BackupRestoreModal: React.FC<BackupRestoreModalProps> = ({
   onRequireEditAccess,
 }) => {
   const [activeTab, setActiveTab] = useState<'backup' | 'restore' | 'server'>('backup');
-  const [serverBackups, setServerBackups] = useState<ServerBackupItem[]>([]);
-  const [isLoadingServerBackups, setIsLoadingServerBackups] = useState(false);
+  const [snapshots, setSnapshots] = useState<BackupItem[]>([]);
+  const [isLoadingSnapshots, setIsLoadingSnapshots] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
 
   // File restore state
@@ -213,32 +219,25 @@ export const BackupRestoreModal: React.FC<BackupRestoreModalProps> = ({
   const [fileStats, setFileStats] = useState<{ total: number; done: number; failed: number } | null>(null);
   const [restoreError, setRestoreError] = useState<string>('');
   const [isDraggingFile, setIsDraggingFile] = useState<boolean>(false);
-  const [confirmServerFileName, setConfirmServerFileName] = useState<string | null>(null);
+  const [confirmSnapshotFileName, setConfirmSnapshotFileName] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Load server backups on open or when switching to server tab
-  const fetchServerBackups = async () => {
-    setIsLoadingServerBackups(true);
+  // Load local browser backup snapshots
+  const refreshSnapshots = () => {
+    setIsLoadingSnapshots(true);
     try {
-      const res = await fetch(`/api/backups?_t=${Date.now()}`, { cache: 'no-store' });
-      if (res.ok) {
-        const json = await res.json();
-        if (json.success && Array.isArray(json.backups)) {
-          setServerBackups(json.backups);
-        }
-      }
-    } catch (e) {
-      console.warn('Gagal memuat daftar backup server:', e);
+      const localList: LocalBackupSnapshot[] = loadLocalBackupSnapshots();
+      setSnapshots(localList);
     } finally {
-      setIsLoadingServerBackups(false);
+      setIsLoadingSnapshots(false);
     }
   };
 
   useEffect(() => {
     if (isOpen) {
-      fetchServerBackups();
+      refreshSnapshots();
       setRestoreError('');
-      setConfirmServerFileName(null);
+      setConfirmSnapshotFileName(null);
     }
   }, [isOpen]);
 
@@ -438,47 +437,43 @@ export const BackupRestoreModal: React.FC<BackupRestoreModalProps> = ({
     }
   };
 
-  // Execute restore from server backup snapshot
-  const handleRestoreFromServer = async (backupItem: ServerBackupItem) => {
+  const handleCreateManualSnapshot = () => {
+    const snap = saveLocalBackupSnapshot(samples, 'Backup_Manual_SITASI');
+    refreshSnapshots();
+    if (snap) {
+      showToast(`✅ Snapshot cadangan "${snap.fileName}" berhasil disimpan di browser!`, 'success');
+    } else {
+      showToast('Gagal menyimpan snapshot (memori browser penuh). Gunakan tombol "Backup ke Device" untuk simpan file JSON.', 'error');
+    }
+  };
+
+  // Execute restore from saved browser snapshot
+  const handleRestoreFromSnapshot = async (backupItem: BackupItem) => {
     if (!canEdit) {
       showToast('Akses ditolak: Hanya Akun Pemilik atau akun dengan izin yang dapat merestore data.', 'error');
       return;
     }
 
-    if (confirmServerFileName !== backupItem.fileName) {
-      setConfirmServerFileName(backupItem.fileName);
+    if (confirmSnapshotFileName !== backupItem.fileName) {
+      setConfirmSnapshotFileName(backupItem.fileName);
       return;
     }
 
-    setConfirmServerFileName(null);
+    setConfirmSnapshotFileName(null);
     setIsProcessing(true);
     try {
-      const res = await postJsonWithRetry('/api/backups/restore', {
-        fileName: backupItem.fileName,
-      });
-      const json = res.data;
-      if (res.ok && json?.success) {
-        const sRes = await fetch(`/api/samples?_t=${Date.now()}`, { cache: 'no-store' });
-        if (sRes.ok) {
-          const sJson = await sRes.json();
-          const extracted = extractSampleArrayFromPayload(sJson);
-          if (sJson.success && extracted) {
-            const { items } = normalizeRestoredSamples(extracted);
-            if (items.length > 0) {
-              await onRestoreSamples(items, `Server: ${backupItem.fileName}`);
-              showToast(`✅ Berhasil! Data telah dipulihkan dari ${backupItem.fileName}`, 'success');
-              onClose();
-              return;
-            }
-          }
-        }
+      const { items } = normalizeRestoredSamples(backupItem.samples);
+      if (items.length === 0) {
+        showToast('Data snapshot tidak valid atau kosong.', 'error');
+        return;
       }
-      showToast(
-        extractErrorMessage(json?.error ?? json?.message ?? res.networkError, 'Gagal merestore dari server.'),
-        'error'
-      );
+      const success = await onRestoreSamples(items, `Snapshot: ${backupItem.fileName}`);
+      if (success) {
+        showToast(`✅ Berhasil! Data telah dipulihkan dari ${backupItem.fileName}`, 'success');
+        onClose();
+      }
     } catch (e) {
-      showToast(extractErrorMessage(e, 'Terjadi kesalahan saat merestore data dari server.'), 'error');
+      showToast(extractErrorMessage(e, 'Terjadi kesalahan saat merestore data dari snapshot.'), 'error');
     } finally {
       setIsProcessing(false);
     }
@@ -549,7 +544,7 @@ export const BackupRestoreModal: React.FC<BackupRestoreModalProps> = ({
             type="button"
             onClick={() => {
               setActiveTab('server');
-              fetchServerBackups();
+              refreshSnapshots();
             }}
             className={`flex-1 py-3 px-4 flex items-center justify-center gap-1.5 transition-colors border-b-2 cursor-pointer ${
               activeTab === 'server'
@@ -558,7 +553,7 @@ export const BackupRestoreModal: React.FC<BackupRestoreModalProps> = ({
             }`}
           >
             <HardDrive className="w-4 h-4 text-amber-600" />
-            <span>Riwayat Backup Server ({serverBackups.length})</span>
+            <span>Riwayat Snapshot ({snapshots.length})</span>
           </button>
         </div>
 
@@ -747,65 +742,64 @@ export const BackupRestoreModal: React.FC<BackupRestoreModalProps> = ({
             </div>
           )}
 
-          {/* TAB 3: RIWAYAT BACKUP SERVER */}
+          {/* TAB 3: RIWAYAT SNAPSHOT BROWSER */}
           {activeTab === 'server' && (
             <div className="space-y-4">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2">
                 <div>
-                  <h4 className="text-xs font-bold text-slate-800">Snapshot Backup di Server</h4>
-                  <p className="text-[11px] text-slate-500">Setiap klik "Simpan Perubahan", server otomatis membuat snapshot berkas</p>
+                  <h4 className="text-xs font-bold text-slate-800">Snapshot Backup di Browser</h4>
+                  <p className="text-[11px] text-slate-500">Setiap klik "Simpan Perubahan", snapshot cadangan dibuat otomatis</p>
                 </div>
-                <button
-                  type="button"
-                  onClick={fetchServerBackups}
-                  className="p-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-600 transition-colors cursor-pointer"
-                  title="Muat ulang daftar backup server"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${isLoadingServerBackups ? 'animate-spin' : ''}`} />
-                </button>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={handleCreateManualSnapshot}
+                    className="px-2.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-[11px] font-bold transition-colors cursor-pointer"
+                  >
+                    + Buat Snapshot
+                  </button>
+                  <button
+                    type="button"
+                    onClick={refreshSnapshots}
+                    className="p-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-600 transition-colors cursor-pointer"
+                    title="Muat ulang daftar snapshot"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${isLoadingSnapshots ? 'animate-spin' : ''}`} />
+                  </button>
+                </div>
               </div>
 
               {!canEdit && (
                 <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-[11px] text-amber-900 flex items-center gap-2">
                   <ShieldAlert className="w-4 h-4 text-amber-600 shrink-0" />
-                  <span>Login dengan Akun Pemilik untuk memulihkan snapshot dari server.</span>
+                  <span>Login dengan Akun Pemilik untuk memulihkan snapshot.</span>
                 </div>
               )}
 
-              {isLoadingServerBackups ? (
+              {isLoadingSnapshots ? (
                 <div className="py-8 text-center text-xs text-slate-500">
                   <div className="w-6 h-6 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin mx-auto mb-2"></div>
-                  <span>Memeriksa berkas backup di server...</span>
+                  <span>Memeriksa daftar snapshot cadangan...</span>
                 </div>
-              ) : serverBackups.length === 0 ? (
+              ) : snapshots.length === 0 ? (
                 <div className="bg-slate-50 rounded-xl p-6 text-center text-xs text-slate-500 border border-slate-200">
                   <HardDrive className="w-8 h-8 text-slate-400 mx-auto mb-2" />
-                  <span>Belum ada snapshot backup tersimpan di server.</span>
+                  <span>Belum ada snapshot cadangan tersimpan. Klik "+ Buat Snapshot" atau "Simpan Perubahan".</span>
                 </div>
               ) : (
                 <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
-                  {serverBackups.map((item) => {
-                    const isSnapshot1134 = item.fileName.includes('1134');
-                    const isConfirming = confirmServerFileName === item.fileName;
+                  {snapshots.map((item) => {
+                    const isConfirming = confirmSnapshotFileName === item.fileName;
                     return (
                       <div
                         key={item.fileName}
-                        className={`p-3 rounded-xl border transition-all flex items-center justify-between gap-2 ${
-                          isSnapshot1134
-                            ? 'bg-amber-50/70 border-amber-300 ring-1 ring-amber-400/40'
-                            : 'bg-white border-slate-200 hover:border-slate-300'
-                        }`}
+                        className="p-3 rounded-xl border bg-white border-slate-200 hover:border-slate-300 transition-all flex items-center justify-between gap-2"
                       >
                         <div className="space-y-0.5 min-w-0">
                           <div className="flex items-center space-x-1.5">
                             <span className="font-mono text-xs font-bold text-slate-800 truncate max-w-[220px]">
                               {item.fileName}
                             </span>
-                            {isSnapshot1134 && (
-                              <span className="text-[9px] font-black uppercase px-1.5 py-0.5 rounded bg-amber-500 text-white shrink-0">
-                                Progres 11.34 WIB
-                              </span>
-                            )}
                           </div>
                           <div className="flex items-center space-x-2 text-[10px] text-slate-500">
                             <span>{new Date(item.createdAt).toLocaleString('id-ID')}</span>
@@ -820,7 +814,7 @@ export const BackupRestoreModal: React.FC<BackupRestoreModalProps> = ({
                           <div className="flex items-center gap-1.5 shrink-0">
                             <button
                               type="button"
-                              onClick={() => handleRestoreFromServer(item)}
+                              onClick={() => handleRestoreFromSnapshot(item)}
                               disabled={isProcessing}
                               className="px-2.5 py-1.5 rounded-lg text-[11px] font-bold bg-rose-600 hover:bg-rose-700 text-white cursor-pointer disabled:opacity-50"
                             >
@@ -828,7 +822,7 @@ export const BackupRestoreModal: React.FC<BackupRestoreModalProps> = ({
                             </button>
                             <button
                               type="button"
-                              onClick={() => setConfirmServerFileName(null)}
+                              onClick={() => setConfirmSnapshotFileName(null)}
                               disabled={isProcessing}
                               className="px-2 py-1.5 rounded-lg text-[11px] font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 cursor-pointer"
                             >
@@ -838,13 +832,9 @@ export const BackupRestoreModal: React.FC<BackupRestoreModalProps> = ({
                         ) : (
                           <button
                             type="button"
-                            onClick={() => handleRestoreFromServer(item)}
+                            onClick={() => handleRestoreFromSnapshot(item)}
                             disabled={isProcessing || !canEdit}
-                            className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center space-x-1 cursor-pointer disabled:opacity-50 shrink-0 ${
-                              isSnapshot1134
-                                ? 'bg-amber-600 hover:bg-amber-700 text-white shadow-xs'
-                                : 'bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200'
-                            }`}
+                            className="px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center space-x-1 cursor-pointer disabled:opacity-50 shrink-0 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200"
                           >
                             <RotateCcw className="w-3 h-3" />
                             <span>Pulihkan</span>
@@ -862,7 +852,7 @@ export const BackupRestoreModal: React.FC<BackupRestoreModalProps> = ({
 
         {/* Footer info */}
         <div className="bg-slate-50 px-6 py-3 border-t border-slate-200 flex items-center justify-between text-[11px] text-slate-500">
-          <span>Data tersinkronisasi aman ke database lokal, server & Supabase</span>
+          <span>Data tersinkronisasi aman ke browser & Supabase</span>
           <button
             type="button"
             onClick={onClose}

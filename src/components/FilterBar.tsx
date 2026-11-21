@@ -426,8 +426,8 @@ export const FilterBar: React.FC<FilterBarProps> = ({
                 disabled={isSavingToServer}
                 title={
                   unsavedCount > 0
-                    ? `Klik untuk mengirim ${unsavedCount} perubahan baru ke server`
-                    : 'Semua perubahan telah tersimpan di server. Klik untuk simpan ulang kapan saja'
+                    ? `Klik untuk menyimpan ${unsavedCount} perubahan baru`
+                    : 'Semua perubahan telah tersimpan. Klik untuk simpan ulang & backup kapan saja'
                 }
                 className={`inline-flex items-center text-xs font-bold px-3 py-1.5 rounded-lg shadow-xs transition-all cursor-pointer ${
                   isSavingToServer
@@ -440,7 +440,7 @@ export const FilterBar: React.FC<FilterBarProps> = ({
                 {isSavingToServer ? (
                   <>
                     <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin mr-1.5"></div>
-                    <span>Menyimpan ke Server...</span>
+                    <span>Menyimpan Perubahan...</span>
                   </>
                 ) : unsavedCount > 0 ? (
                   <>
