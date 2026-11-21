@@ -680,7 +680,10 @@ export default function App() {
         }
       } else {
         setSyncStatus('offline');
-        const errMsg = extractErrorMessage(json?.error ?? json?.message ?? json, 'Akses ditolak atau server bermasalah');
+        const errMsg =
+          res.status === 404
+            ? 'Endpoint penyimpanan server (/api/samples) belum aktif di tautan ini (HTTP 404). Aktifkan Supabase atau buka melalui server full-stack.'
+            : extractErrorMessage(json?.error ?? json?.message ?? json, 'Akses ditolak atau server bermasalah');
         showToast(`Gagal menyimpan ke server: ${errMsg}`, 'error');
       }
     } catch (err) {
@@ -921,6 +924,37 @@ export default function App() {
   const handleLoginAccess = async (keyOrPin: string, email?: string) => {
     const res = await postJsonWithRetry('/api/permissions/verify', { keyOrPin, email }, { retries: 2, timeoutMs: 10000 });
     const json = res.data;
+    const trimmedEmail = String(email || '').trim().toLowerCase();
+    const configuredOwnerEmail = String(permissionConfig?.ownerEmail || 'sifarofatunnisa24@gmail.com').toLowerCase();
+
+    // If backend /api/* returns 404 (e.g., static preview / Share URL before full-stack republish):
+    // - Non-owner Google accounts still get clean Read-Only ('guest') access without crashing or failing with [404].
+    // - Owner account receives a clear actionable message instead of cryptic "[404] The page could not be found".
+    if (res.status === 404) {
+      if (trimmedEmail && trimmedEmail !== configuredOwnerEmail) {
+        const guestMsg = `Berhasil login dengan akun Google ${trimmedEmail}. Anda memiliki akses Melihat data (Hanya Lihat).`;
+        const guestSession: UserAuthSession = {
+          role: 'guest',
+          email: trimmedEmail,
+          displayName: trimmedEmail,
+          token: `guest_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+          canEdit: false,
+          loginAt: new Date().toISOString(),
+        };
+        setAuthSession(guestSession);
+        try {
+          localStorage.setItem('sitasi_auth_session', JSON.stringify(guestSession));
+        } catch {}
+        showToast(guestMsg, 'success');
+        return { success: true, message: guestMsg };
+      }
+
+      return {
+        success: false,
+        message:
+          'Server autentikasi (/api/permissions/verify) tidak ditemukan (HTTP 404). Tautan pratinjau statis tidak menjalankan backend Node.js — silakan buka melalui Development App URL atau lakukan Share/Publish ulang aplikasi.',
+      };
+    }
 
     if (!json) {
       return {
