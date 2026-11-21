@@ -1,0 +1,6 @@
+{
+  "name": "SITASI 2026 - Monitoring Lapangan & Sampel",
+  "description": "Dashboard Monitoring Progres Petugas Lapangan & Checklist Sampel Survei Pertanian Terintegrasi (SITASI) 2026 BPS.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
