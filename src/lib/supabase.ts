@@ -191,26 +191,36 @@ export function formatSupabaseError(error: PostgrestError | Error | unknown): {
   }
 
   if (typeof error === 'object' && error !== null && 'message' in error) {
-    const pgErr = error as Partial<PostgrestError> & { message: string };
-    const code = pgErr.code ? String(pgErr.code) : undefined;
+    const pgErr = error as Partial<PostgrestError> & { message: unknown };
+    const code = pgErr.code !== undefined && pgErr.code !== null ? String(pgErr.code) : undefined;
+    const rawMsg =
+      typeof pgErr.message === 'string'
+        ? pgErr.message
+        : typeof pgErr.message === 'object' && pgErr.message !== null
+        ? JSON.stringify(pgErr.message)
+        : String(pgErr.message || 'Terjadi kesalahan Supabase.');
     const detailParts: string[] = [];
 
-    if (pgErr.details) detailParts.push(`Detail: ${pgErr.details}`);
-    if (pgErr.hint) detailParts.push(`Saran: ${pgErr.hint}`);
+    if (pgErr.details) {
+      detailParts.push(`Detail: ${typeof pgErr.details === 'string' ? pgErr.details : JSON.stringify(pgErr.details)}`);
+    }
+    if (pgErr.hint) {
+      detailParts.push(`Saran: ${typeof pgErr.hint === 'string' ? pgErr.hint : JSON.stringify(pgErr.hint)}`);
+    }
 
     let friendlyPrefix = '';
-    if (code === '42P01' || pgErr.message.includes('does not exist') || pgErr.message.includes('schema cache')) {
+    if (code === '42P01' || rawMsg.includes('does not exist') || rawMsg.includes('schema cache')) {
       friendlyPrefix =
         'Tabel "sitasi_samples" belum ditemukan di Supabase. Jalankan skrip supabase_schema.sql di SQL Editor Supabase terlebih dahulu. ';
-    } else if (code === '42703' || pgErr.message.includes('column')) {
+    } else if (code === '42703' || rawMsg.includes('column')) {
       friendlyPrefix =
         'Terdapat ketidaksesuaian kolom pada tabel Supabase. Pastikan struktur tabel sesuai supabase_schema.sql. ';
-    } else if (code === '42501' || pgErr.message.toLowerCase().includes('row-level security')) {
+    } else if (code === '42501' || rawMsg.toLowerCase().includes('row-level security')) {
       friendlyPrefix =
         'Akses ditolak oleh kebijakan Row Level Security (RLS) Supabase. Jalankan kebijakan RLS pada supabase_schema.sql. ';
     }
 
-    const fullMsg = `${friendlyPrefix}${pgErr.message}${
+    const fullMsg = `${friendlyPrefix}${rawMsg}${
       detailParts.length > 0 ? ` (${detailParts.join(' | ')})` : ''
     }`;
 

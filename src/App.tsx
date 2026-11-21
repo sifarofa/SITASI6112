@@ -42,7 +42,7 @@ import {
   exportRekapToCSV
 } from './utils/export';
 import { formatDateTimeZone, formatShortTimeZone } from './utils/timezone';
-import { postJsonWithRetry } from './utils/api';
+import { postJsonWithRetry, extractErrorMessage } from './utils/api';
 import {
   getSupabaseClient,
   getIsSupabaseConfigured,
@@ -110,8 +110,9 @@ export default function App() {
   // Toast notification
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'info' | 'error' } | null>(null);
 
-  const showToast = useCallback((message: string, type: 'success' | 'info' | 'error' = 'success') => {
-    setToast({ message, type });
+  const showToast = useCallback((message: unknown, type: 'success' | 'info' | 'error' = 'success') => {
+    const safeMessage = extractErrorMessage(message, 'Notifikasi sistem');
+    setToast({ message: safeMessage, type });
     setTimeout(() => {
       setToast(null);
     }, 3500);
@@ -599,13 +600,20 @@ export default function App() {
         }),
       });
 
-      const json = await res.json();
-      if ((res.ok && json.success) || getIsSupabaseConfigured()) {
+      let json: Record<string, any> | null = null;
+      try {
+        const rawText = await res.text();
+        json = rawText ? JSON.parse(rawText) : null;
+      } catch {
+        json = null;
+      }
+
+      if ((res.ok && json?.success) || getIsSupabaseConfigured()) {
         lastSavedSamplesRef.current = samples;
         setUnsavedCount(0);
         unsavedCountRef.current = 0;
         setSyncStatus('synced');
-        const timeResult = formatDateTimeZone((res.ok && json.updatedAt) || new Date());
+        const timeResult = formatDateTimeZone((res.ok && json?.updatedAt) || new Date());
         setLastSavedAt(timeResult.displayFull);
 
         // Otomatis Simpan Backup ke Internal Device (dengan dialog memilih folder/lokasi file)
@@ -672,7 +680,8 @@ export default function App() {
         }
       } else {
         setSyncStatus('offline');
-        showToast(`Gagal menyimpan ke server: ${json.error || 'Akses ditolak atau server bermasalah'}`, 'error');
+        const errMsg = extractErrorMessage(json?.error ?? json?.message ?? json, 'Akses ditolak atau server bermasalah');
+        showToast(`Gagal menyimpan ke server: ${errMsg}`, 'error');
       }
     } catch (err) {
       console.error('Error saving to server:', err);
@@ -764,11 +773,12 @@ export default function App() {
       showToast('Belum ada data tersimpan atau Supabase belum dikonfigurasi.', 'info');
     } catch (err: any) {
       console.error('Error refreshing data:', err);
+      const safeErr = extractErrorMessage(err, 'Gagal terhubung ke Supabase.');
       if (getIsSupabaseConfigured()) {
         setSupabaseSyncState('error');
-        setSupabaseSyncError(err?.message || 'Gagal terhubung ke Supabase.');
+        setSupabaseSyncError(safeErr);
       }
-      showToast(`Gagal sinkronisasi data: ${err?.message || 'Periksa jaringan'}`, 'error');
+      showToast(`Gagal sinkronisasi data: ${safeErr}`, 'error');
     } finally {
       setIsRefreshingSupabase(false);
       setIsSyncingServer(false);
@@ -888,9 +898,10 @@ export default function App() {
               showToast(`${toastMsg} (Tersinkron ke Supabase)`, 'success');
             }
           } catch (err: any) {
+            const safeErr = extractErrorMessage(err, 'Gagal menghubungi Supabase.');
             setSupabaseSyncState('error');
-            setSupabaseSyncError(err?.message || 'Gagal menghubungi Supabase.');
-            showToast(`Gagal sinkron ke Supabase: ${err?.message || 'Periksa koneksi'}`, 'error');
+            setSupabaseSyncError(safeErr);
+            showToast(`Gagal sinkron ke Supabase: ${safeErr}`, 'error');
           }
         })();
         return;
@@ -915,18 +926,27 @@ export default function App() {
       return {
         success: false,
         message: res.networkError
-          ? `Gagal menghubungi server autentikasi (${res.networkError})`
+          ? `Gagal menghubungi server autentikasi (${extractErrorMessage(res.networkError, 'Koneksi terganggu')})`
           : 'Gagal menghubungi server autentikasi.',
       };
     }
 
     if (json.success) {
       const isOwnerRole = json.role === 'owner';
+      const safeEmail = typeof json.email === 'string' && json.email ? json.email : email;
+      const safeDisplayName =
+        typeof json.displayName === 'string' && json.displayName
+          ? json.displayName
+          : isOwnerRole
+          ? 'Pemilik (sifarofatunnisa24@gmail.com)'
+          : safeEmail || 'Pengguna Google';
+      const safeSuccessMsg = extractErrorMessage(json.message, 'Login berhasil!');
+
       const session: UserAuthSession = {
-        role: json.role,
-        email: json.email || email,
-        displayName: json.displayName || (isOwnerRole ? 'Pemilik (sifarofatunnisa24@gmail.com)' : (json.email || email || 'Pengguna Google')),
-        token: json.token,
+        role: json.role === 'owner' || json.role === 'editor' || json.role === 'guest' ? json.role : 'guest',
+        email: safeEmail,
+        displayName: safeDisplayName,
+        token: typeof json.token === 'string' ? json.token : undefined,
         canEdit: isOwnerRole || json.role === 'editor',
         loginAt: new Date().toISOString(),
       };
@@ -940,11 +960,14 @@ export default function App() {
           localStorage.setItem('sitasi_auth_session', JSON.stringify(session));
         } catch {}
       }
-      showToast(json.message || 'Login berhasil!', 'success');
-      return { success: true, message: json.message };
+      showToast(safeSuccessMsg, 'success');
+      return { success: true, message: safeSuccessMsg };
     }
 
-    return { success: false, message: json.error || json.message || 'Gagal login akun Google.' };
+    return {
+      success: false,
+      message: extractErrorMessage(json.error ?? json.message ?? json, 'Gagal login akun Google.'),
+    };
   };
 
   const handleLogoutAccess = () => {
@@ -984,18 +1007,22 @@ export default function App() {
       return {
         success: false,
         message: res.networkError
-          ? `Gagal menghubungi server pengaturan izin (${res.networkError})`
+          ? `Gagal menghubungi server pengaturan izin (${extractErrorMessage(res.networkError, 'Koneksi terganggu')})`
           : 'Gagal menghubungi server pengaturan izin.',
       };
     }
 
     if (json.success) {
       setPermissionConfig(json.data || json.config);
-      showToast('Pengaturan hak akses berhasil diperbarui!', 'success');
-      return { success: true, message: json.message };
+      const okMsg = extractErrorMessage(json.message, 'Pengaturan hak akses berhasil diperbarui!');
+      showToast(okMsg, 'success');
+      return { success: true, message: okMsg };
     }
 
-    return { success: false, message: json.error || json.message || 'Gagal memperbarui izin' };
+    return {
+      success: false,
+      message: extractErrorMessage(json.error ?? json.message ?? json, 'Gagal memperbarui izin'),
+    };
   };
 
 
@@ -2088,6 +2115,10 @@ export default function App() {
         onRestoreSamples={handleRestoreSamples}
         showToast={showToast}
         canEdit={authSession.canEdit}
+        onRequireEditAccess={() => {
+          setIsBackupRestoreOpen(false);
+          setIsLoginModalOpen(true);
+        }}
       />
 
       {/* Google Login Modal */}

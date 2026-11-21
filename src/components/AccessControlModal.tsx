@@ -22,7 +22,7 @@ import {
   UserX
 } from 'lucide-react';
 import { UserRole, PermissionConfig, UserAuthSession } from '../types/sitasi';
-import { postJsonWithRetry } from '../utils/api';
+import { postJsonWithRetry, extractErrorMessage } from '../utils/api';
 
 interface AccessControlModalProps {
   isOpen: boolean;
@@ -109,7 +109,7 @@ export const AccessControlModal: React.FC<AccessControlModalProps> = ({
     setIsSubmitting(false);
 
     if (result.success) {
-      showToast(result.message, 'success');
+      showToast(extractErrorMessage(result.message, 'Login berhasil!'), 'success');
       setInputKey('');
       if (emailToVerify.toLowerCase() === ownerEmail.toLowerCase()) {
         setActiveTab('manage');
@@ -117,7 +117,7 @@ export const AccessControlModal: React.FC<AccessControlModalProps> = ({
         onClose();
       }
     } else {
-      showToast(result.message || 'Akses ditolak atau PIN/Kunci salah.', 'error');
+      showToast(extractErrorMessage(result.message, 'Akses ditolak atau PIN/Kunci salah.'), 'error');
     }
   };
 
@@ -173,11 +173,11 @@ export const AccessControlModal: React.FC<AccessControlModalProps> = ({
     setIsSubmitting(false);
 
     if (res.success) {
-      showToast(res.message, 'success');
+      showToast(extractErrorMessage(res.message, 'Pengaturan hak akses berhasil diperbarui.'), 'success');
       setVerifyPin('');
       setNewPin('');
     } else {
-      showToast(res.message, 'error');
+      showToast(extractErrorMessage(res.message, 'Gagal menyimpan pengaturan.'), 'error');
     }
   };
 
@@ -212,12 +212,12 @@ export const AccessControlModal: React.FC<AccessControlModalProps> = ({
       } else if (!json) {
         showToast(
           res.networkError
-            ? `Gagal menghubungi server untuk mengubah PIN (${res.networkError}).`
+            ? `Gagal menghubungi server untuk mengubah PIN (${extractErrorMessage(res.networkError, 'Koneksi terganggu')}).`
             : 'Gagal menghubungi server untuk mengubah PIN.',
           'error'
         );
       } else {
-        showToast(json.error || json.message || 'Gagal mengubah PIN Pemilik. Pastikan PIN saat ini benar.', 'error');
+        showToast(extractErrorMessage(json.error ?? json.message ?? json, 'Gagal mengubah PIN Pemilik. Pastikan PIN saat ini benar.'), 'error');
       }
     } catch {
       showToast('Gagal menghubungi server untuk mengubah PIN.', 'error');

@@ -32,6 +32,7 @@ import {
   SupabaseSyncProgress,
   SUPABASE_UPSERT_BATCH_SIZE,
 } from '../lib/supabase';
+import { extractErrorMessage } from '../utils/api';
 
 export interface UploadedFileItem {
   id: string;
@@ -98,7 +99,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
         errorMsg = 'Format file tidak sesuai template SITASI 2026.';
       }
     } catch (err: any) {
-      errorMsg = err.message || 'Gagal membaca file.';
+      errorMsg = extractErrorMessage(err, 'Gagal membaca file.');
     }
 
     const totalUtama = samples.filter(s => s.statusSampel === 'U').length;
@@ -244,8 +245,10 @@ export const UploadModal: React.FC<UploadModalProps> = ({
 
       if (!syncResult.success) {
         setSupabaseError(
-          syncResult.error ||
+          extractErrorMessage(
+            syncResult.error,
             'Gagal menyinkronkan data ke Supabase. Periksa kesesuaian kolom tabel sitasi_samples.'
+          )
         );
         return;
       }

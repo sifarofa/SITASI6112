@@ -13,6 +13,7 @@ import {
   Info
 } from 'lucide-react';
 import { GoogleIcon } from './GoogleIcon';
+import { extractErrorMessage } from '../utils/api';
 
 interface GoogleLoginModalProps {
   isOpen: boolean;
@@ -65,15 +66,15 @@ export const GoogleLoginModal: React.FC<GoogleLoginModalProps> = ({
     try {
       const result = await onLogin(trimmedEmail, pin.trim());
       if (result.success) {
-        showToast(result.message, 'success');
+        showToast(extractErrorMessage(result.message, 'Login berhasil!'), 'success');
         setEmail('');
         setPin('');
         onClose();
       } else {
-        setErrorMessage(result.message || 'Gagal masuk dengan akun Google.');
+        setErrorMessage(extractErrorMessage(result.message, 'Gagal masuk dengan akun Google.'));
       }
     } catch (err: any) {
-      setErrorMessage('Terjadi gangguan saat menghubungkan ke server.');
+      setErrorMessage(extractErrorMessage(err, 'Terjadi gangguan saat menghubungkan ke server.'));
     } finally {
       setIsSubmitting(false);
     }

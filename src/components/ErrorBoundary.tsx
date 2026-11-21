@@ -1,5 +1,6 @@
 import React from 'react';
 import { AlertTriangle, RefreshCw, RotateCcw } from 'lucide-react';
+import { extractErrorMessage } from '../utils/api';
 
 interface ErrorBoundaryState {
   hasError: boolean;
@@ -15,10 +16,13 @@ export class ErrorBoundary extends React.Component<
     this.state = { hasError: false, errorMessage: '' };
   }
 
-  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+  static getDerivedStateFromError(error: unknown): ErrorBoundaryState {
     return {
       hasError: true,
-      errorMessage: error?.message || 'Terjadi kesalahan tampilan yang tidak terduga.',
+      errorMessage: extractErrorMessage(
+        error,
+        'Terjadi kesalahan tampilan yang tidak terduga.'
+      ),
     };
   }
 

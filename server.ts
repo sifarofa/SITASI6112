@@ -517,7 +517,11 @@ async function startServer() {
         let sampleCount = 0;
         try {
           const parsed = JSON.parse(fs.readFileSync(fullPath, 'utf-8'));
-          if (Array.isArray(parsed)) sampleCount = parsed.length;
+          if (Array.isArray(parsed)) {
+            sampleCount = parsed.length;
+          } else if (parsed && typeof parsed === 'object' && Array.isArray(parsed.samples)) {
+            sampleCount = parsed.samples.length;
+          }
         } catch {}
         return {
           fileName: file,
@@ -566,15 +570,23 @@ async function startServer() {
   // Restore samples from a server backup file or an uploaded JSON payload
   app.post('/api/backups/restore', (req, res) => {
     try {
-      const { fileName, backupData } = req.body;
+      const { fileName, backupData } = parseSafeBody(req.body);
       let targetSamples: any[] | null = null;
 
       if (Array.isArray(backupData) && backupData.length > 0) {
         targetSamples = backupData;
+      } else if (backupData && typeof backupData === 'object' && Array.isArray((backupData as any).samples)) {
+        targetSamples = (backupData as any).samples;
       } else if (fileName) {
-        const fullPath = path.join(BACKUPS_DIR, fileName);
+        const safeName = path.basename(String(fileName));
+        const fullPath = path.join(BACKUPS_DIR, safeName);
         if (fs.existsSync(fullPath)) {
-          targetSamples = JSON.parse(fs.readFileSync(fullPath, 'utf-8'));
+          const parsed = JSON.parse(fs.readFileSync(fullPath, 'utf-8'));
+          if (Array.isArray(parsed)) {
+            targetSamples = parsed;
+          } else if (parsed && typeof parsed === 'object' && Array.isArray(parsed.samples)) {
+            targetSamples = parsed.samples;
+          }
         }
       }
 
