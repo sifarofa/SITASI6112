@@ -42,6 +42,16 @@ import {
   exportRekapToCSV
 } from './utils/export';
 import { formatDateTimeZone, formatShortTimeZone } from './utils/timezone';
+import {
+  supabase,
+  isSupabaseConfigured,
+  supabaseConfigStatus,
+  SUPABASE_SAMPLES_TABLE,
+  fetchSamplesFromSupabase,
+  upsertSamplesBatchToSupabase,
+  deleteSamplesFromSupabase,
+  replaceAllSamplesInSupabase,
+} from './lib/supabase';
 
 import { Header } from './components/Header';
 import { StatisticsCards } from './components/StatisticsCards';
@@ -73,7 +83,9 @@ import {
   Radio,
   Wifi,
   RefreshCw,
-  Clock
+  Clock,
+  Database,
+  AlertTriangle
 } from 'lucide-react';
 
 export default function App() {
@@ -126,21 +138,34 @@ export default function App() {
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [orientation, setOrientation] = useState<'landscape' | 'portrait'>('landscape');
 
-  // Server synchronization & Manual Save status
+  // Server & Supabase synchronization state
   const [syncStatus, setSyncStatus] = useState<'synced' | 'saving' | 'offline'>('synced');
+  const [supabaseSyncState, setSupabaseSyncState] = useState<'synced' | 'saving' | 'error' | 'unconfigured'>(
+    isSupabaseConfigured ? 'synced' : 'unconfigured'
+  );
+  const [supabaseSyncError, setSupabaseSyncError] = useState<string | null>(
+    supabaseConfigStatus.errorMessage
+  );
+  const [showSupabaseConfigBanner, setShowSupabaseConfigBanner] = useState<boolean>(!isSupabaseConfigured);
+  const [isRefreshingSupabase, setIsRefreshingSupabase] = useState<boolean>(false);
   const [unsavedCount, setUnsavedCount] = useState<number>(0);
   const [isSavingToServer, setIsSavingToServer] = useState<boolean>(false);
   const [isSyncingServer, setIsSyncingServer] = useState<boolean>(false);
   const [lastSavedAt, setLastSavedAt] = useState<string>('');
 
-  // Instant Real-time Synchronization status across devices (SSE stream)
+  // Instant Real-time Synchronization status across devices
   const [isRealtimeConnected, setIsRealtimeConnected] = useState<boolean>(true);
   const [realtimeNotice, setRealtimeNotice] = useState<{ message: string; time: string; updater: string } | null>(null);
   const [realtimePulse, setRealtimePulse] = useState<boolean>(false);
 
-  // Refs to track baseline server data without causing extra renders
+  // Refs to track live & baseline data without causing stale closures
+  const samplesRef = useRef<SampleItem[]>([]);
   const lastSavedSamplesRef = useRef<SampleItem[]>([]);
   const unsavedCountRef = useRef<number>(0);
+
+  useEffect(() => {
+    samplesRef.current = samples;
+  }, [samples]);
 
   // Authentication & Permissions state (Owner, Editor, or Guest)
   // Default: Mode Tamu (Belum Login) agar fitur "Akun Pemilik" HANYA nampak jika login sebagai sifarofatunnisa24@gmail.com
@@ -202,35 +227,59 @@ export default function App() {
     return count;
   }, []);
 
-  // Load initial data (Server first for cross-device synchronization)
+  // Load initial data (Supabase as primary single source of truth, with graceful fallback)
   useEffect(() => {
     const initData = async () => {
       setIsLoading(true);
       let loadedSamples: SampleItem[] | null = null;
+      let latestUpdatedAt: string | undefined;
 
-      // 1. Fetch from server first (cross-device source of truth) with anti-caching
-      let serverUpdatedAt: string | undefined;
-      try {
-        const response = await fetch(`/api/samples?_t=${Date.now()}`, {
-          cache: 'no-store',
-          headers: {
-            'Cache-Control': 'no-cache, no-store, must-revalidate',
-            'Pragma': 'no-cache',
-            'Expires': '0',
-          },
-        });
-        if (response.ok) {
-          const json = await response.json();
-          if (json.success && Array.isArray(json.data) && json.data.length > 0) {
-            loadedSamples = json.data;
-            serverUpdatedAt = json.updatedAt;
+      // 1. Primary Source of Truth: SELECT from Supabase when configured
+      if (isSupabaseConfigured) {
+        setSupabaseSyncState('saving');
+        const supaRes = await fetchSamplesFromSupabase();
+        if (supaRes.success) {
+          setSupabaseSyncState('synced');
+          setSupabaseSyncError(null);
+          if (supaRes.data && supaRes.data.length > 0) {
+            loadedSamples = supaRes.data;
+            latestUpdatedAt = supaRes.updatedAt;
           }
+        } else {
+          setSupabaseSyncState('error');
+          setSupabaseSyncError(supaRes.error || 'Gagal mengambil data dari Supabase.');
         }
-      } catch (err) {
-        console.warn('Gagal menghubungi server untuk memuat data sampel, menggunakan local storage:', err);
+      } else {
+        setSupabaseSyncState('unconfigured');
+        setSupabaseSyncError(supabaseConfigStatus.errorMessage);
       }
 
-      // 2. Fallback to localStorage if server has no samples yet
+      // 2. Fallback to Express server /api/samples if Supabase has 0 rows or is unconfigured/offline
+      if (!loadedSamples || loadedSamples.length === 0) {
+        try {
+          const response = await fetch(`/api/samples?_t=${Date.now()}`, {
+            cache: 'no-store',
+            headers: {
+              'Cache-Control': 'no-cache, no-store, must-revalidate',
+              'Pragma': 'no-cache',
+              'Expires': '0',
+            },
+          });
+          if (response.ok) {
+            const json = await response.json();
+            if (json.success && Array.isArray(json.data) && json.data.length > 0) {
+              loadedSamples = json.data;
+              if (!latestUpdatedAt) {
+                latestUpdatedAt = json.updatedAt;
+              }
+            }
+          }
+        } catch (err) {
+          console.warn('Gagal menghubungi server untuk memuat data sampel, menggunakan local storage:', err);
+        }
+      }
+
+      // 3. Fallback to localStorage if server has no samples yet
       if (!loadedSamples || loadedSamples.length === 0) {
         const saved = loadSavedSamples();
         if (saved && saved.length > 0) {
@@ -238,7 +287,7 @@ export default function App() {
         }
       }
 
-      // 3. Fallback to default CSV file if neither has data
+      // 4. Fallback to default CSV file if neither has data
       if (!loadedSamples || loadedSamples.length === 0) {
         try {
           const response = await fetch('/assets/aistudio/default_samples.csv');
@@ -254,14 +303,15 @@ export default function App() {
       }
 
       if (loadedSamples && loadedSamples.length > 0) {
+        samplesRef.current = loadedSamples;
         setSamples(loadedSamples);
         saveSamples(loadedSamples);
         lastSavedSamplesRef.current = loadedSamples;
         setUnsavedCount(0);
         unsavedCountRef.current = 0;
         setSyncStatus('synced');
-        if (serverUpdatedAt) {
-          const formatted = formatDateTimeZone(serverUpdatedAt);
+        if (latestUpdatedAt) {
+          const formatted = formatDateTimeZone(latestUpdatedAt);
           setLastSavedAt(formatted.displayFull);
         }
       }
@@ -287,10 +337,52 @@ export default function App() {
     initData();
   }, []);
 
+  // Supabase Realtime Subscription (postgres_changes) + SSE fallback
+  useEffect(() => {
+    if (!isSupabaseConfigured || !supabase) return;
+
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+    let isCleanedUp = false;
+
+    const channel = supabase
+      .channel('sitasi_samples_realtime_channel')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: SUPABASE_SAMPLES_TABLE },
+        () => {
+          if (isCleanedUp || unsavedCountRef.current > 0) return;
+          if (debounceTimer) clearTimeout(debounceTimer);
+          debounceTimer = setTimeout(async () => {
+            if (isCleanedUp) return;
+            const supaRes = await fetchSamplesFromSupabase();
+            if (supaRes.success && supaRes.data && supaRes.data.length > 0 && !isCleanedUp) {
+              samplesRef.current = supaRes.data;
+              lastSavedSamplesRef.current = supaRes.data;
+              setSamples(supaRes.data);
+              saveSamples(supaRes.data);
+              setUnsavedCount(0);
+              unsavedCountRef.current = 0;
+              setSyncStatus('synced');
+              setSupabaseSyncState('synced');
+              setSupabaseSyncError(null);
+              const timeInfo = formatDateTimeZone(supaRes.updatedAt || new Date());
+              setLastSavedAt(timeInfo.displayFull);
+              setRealtimePulse(true);
+              setTimeout(() => setRealtimePulse(false), 2000);
+            }
+          }, 500);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      isCleanedUp = true;
+      if (debounceTimer) clearTimeout(debounceTimer);
+      supabase?.removeChannel(channel);
+    };
+  }, []);
+
   // INSTANT REAL-TIME SYNCHRONIZATION VIA SSE (Server-Sent Events)
-  // Ketika Admin/Pemilik (sifarofatunnisa24@gmail.com) mengklik "Simpan Perubahan",
-  // server langsung mem-broadcast event 'samples_updated' ke seluruh device & akun yang membuka dashboard.
-  // Device lain langsung terupdate secara realtime tanpa perlu refresh/reload!
   useEffect(() => {
     let eventSource: EventSource | null = null;
     let reconnectTimer: any = null;
@@ -310,6 +402,8 @@ export default function App() {
         });
 
         eventSource.addEventListener('samples_updated', (event: MessageEvent) => {
+          // If Supabase is active, Supabase Realtime + manual/auto fetch takes priority
+          if (isSupabaseConfigured) return;
           try {
             const payload = JSON.parse(event.data);
             if (payload && Array.isArray(payload.samples)) {
@@ -318,8 +412,8 @@ export default function App() {
               const timeResult = formatDateTimeZone(payload.updatedAt || new Date());
               const updateTime = timeResult.displayFull;
 
-              // Jika client tidak memiliki draf lokal yang belum disimpan:
               if (unsavedCountRef.current === 0) {
+                samplesRef.current = incomingSamples;
                 lastSavedSamplesRef.current = incomingSamples;
                 setSamples(incomingSamples);
                 saveSamples(incomingSamples);
@@ -328,7 +422,6 @@ export default function App() {
                 setSyncStatus('synced');
                 setLastSavedAt(updateTime);
 
-                // Flash animasi indikator & alert
                 setRealtimePulse(true);
                 setTimeout(() => setRealtimePulse(false), 3000);
 
@@ -338,9 +431,8 @@ export default function App() {
                   updater: updatedBy,
                 });
 
-                showToast(`⚡ Sinkron Realtime: Progres baru saja diperbarui oleh ${updatedBy} (${updateTime})!`, 'info');
+                showToast(`⚡ Sinkronisasi Otomatis: Progres baru saja diperbarui oleh ${updatedBy} (${updateTime})!`, 'info');
               } else {
-                // Jika sedang ada draf checklist lokal yang belum disimpan, amankan draf pengguna
                 showToast(`ℹ️ Server diperbarui oleh ${updatedBy} (${updateTime}). Simpan perubahan lokal Anda jika ingin memperbarui.`, 'info');
               }
             }
@@ -367,10 +459,32 @@ export default function App() {
 
     connectSSE();
 
-    // Safety-net periodic check (every 12 detik) jika koneksi internet terputus-putus
-    // Safety-net periodic check (every 10 detik) jika koneksi internet terputus-putus
+    // Safety-net periodic check every 15s
     const safetyPollInterval = setInterval(async () => {
       if (unsavedCountRef.current > 0) return;
+      if (isSupabaseConfigured) {
+        try {
+          const supaRes = await fetchSamplesFromSupabase();
+          if (supaRes.success && supaRes.data && supaRes.data.length > 0 && !isCleanedUp) {
+            const currentDigest = lastSavedSamplesRef.current.map((s: any) => `${s.id}:${s.progressStatus}:${s.hasilPendataanFasih || ''}:${s.nusPengganti || ''}:${s.catatanPetugas || ''}`).join('|');
+            const serverDigest = supaRes.data.map((s: any) => `${s.id}:${s.progressStatus}:${s.hasilPendataanFasih || ''}:${s.nusPengganti || ''}:${s.catatanPetugas || ''}`).join('|');
+            if (currentDigest !== serverDigest) {
+              samplesRef.current = supaRes.data;
+              lastSavedSamplesRef.current = supaRes.data;
+              setSamples(supaRes.data);
+              saveSamples(supaRes.data);
+              setUnsavedCount(0);
+              unsavedCountRef.current = 0;
+              setSyncStatus('synced');
+              setSupabaseSyncState('synced');
+              if (supaRes.updatedAt) {
+                setLastSavedAt(formatDateTimeZone(supaRes.updatedAt).displayFull);
+              }
+            }
+          }
+        } catch {}
+        return;
+      }
       try {
         const res = await fetch(`/api/samples?_t=${Date.now()}`, {
           cache: 'no-store',
@@ -385,6 +499,7 @@ export default function App() {
             const currentDigest = lastSavedSamplesRef.current.map((s: any) => `${s.id}:${s.progressStatus}:${s.hasilPendataanFasih || ''}:${s.nusPengganti || ''}:${s.catatanPetugas || ''}`).join('|');
             const serverDigest = json.data.map((s: any) => `${s.id}:${s.progressStatus}:${s.hasilPendataanFasih || ''}:${s.nusPengganti || ''}:${s.catatanPetugas || ''}`).join('|');
             if (currentDigest !== serverDigest) {
+              samplesRef.current = json.data;
               lastSavedSamplesRef.current = json.data;
               setSamples(json.data);
               saveSamples(json.data);
@@ -395,7 +510,7 @@ export default function App() {
           }
         }
       } catch {}
-    }, 10000);
+    }, 15000);
 
     return () => {
       isCleanedUp = true;
@@ -407,19 +522,38 @@ export default function App() {
     };
   }, [showToast]);
 
-  // MANUAL SAVE TO SERVER:
-  // Perubahan checklist, status, pengganti hanya dikirim ke server saat tombol diklik secara manual.
+  // MANUAL SAVE TO SUPABASE & SERVER:
   const handleManualSaveToServer = useCallback(async () => {
     if (!authSession.canEdit) {
-      showToast('Akses ditolak: Hanya Akun Pemilik atau akun dengan izin edit yang dapat menyimpan ke server!', 'error');
+      showToast('Akses ditolak: Hanya Akun Pemilik atau akun dengan izin edit yang dapat menyimpan perubahan!', 'error');
       setIsAccessModalOpen(true);
       return;
     }
 
     setIsSavingToServer(true);
     setSyncStatus('saving');
+    if (isSupabaseConfigured) {
+      setSupabaseSyncState('saving');
+      setSupabaseSyncError(null);
+    }
 
     try {
+      // 1. Sync full dataset to Supabase when configured
+      if (isSupabaseConfigured) {
+        const supaSaveRes = await upsertSamplesBatchToSupabase(samples);
+        if (!supaSaveRes.success) {
+          setSupabaseSyncState('error');
+          setSupabaseSyncError(supaSaveRes.error || 'Gagal menyimpan ke Supabase.');
+          setSyncStatus('offline');
+          showToast(`Gagal menyimpan ke Supabase: ${supaSaveRes.error}`, 'error');
+          setIsSavingToServer(false);
+          return;
+        }
+        setSupabaseSyncState('synced');
+        setSupabaseSyncError(null);
+      }
+
+      // 2. Also persist to Express backup endpoint
       const res = await fetch('/api/samples', {
         method: 'POST',
         headers: {
@@ -437,12 +571,12 @@ export default function App() {
       });
 
       const json = await res.json();
-      if (res.ok && json.success) {
+      if ((res.ok && json.success) || isSupabaseConfigured) {
         lastSavedSamplesRef.current = samples;
         setUnsavedCount(0);
         unsavedCountRef.current = 0;
         setSyncStatus('synced');
-        const timeResult = formatDateTimeZone(json.updatedAt || new Date());
+        const timeResult = formatDateTimeZone((res.ok && json.updatedAt) || new Date());
         setLastSavedAt(timeResult.displayFull);
 
         // Otomatis Simpan Backup ke Internal Device (dengan dialog memilih folder/lokasi file)
@@ -520,12 +654,49 @@ export default function App() {
     }
   }, [authSession, samples, showToast]);
 
-  // MANUAL SYNC PERUBAHAN DARI SERVER:
-  // User lain selain pemilik (maupun Admin) dapat mengklik tombol ini kapan saja
-  // untuk menarik update progress monitoring lapangan realtime yang telah disimpan oleh Admin/Pemilik
-  const handleManualSyncFromServer = useCallback(async () => {
+  // SINKRONKAN ULANG / REFRESH DATA DARI SUPABASE (atau server fallback)
+  const handleRefreshFromSupabase = useCallback(async () => {
+    setIsRefreshingSupabase(true);
     setIsSyncingServer(true);
     try {
+      if (isSupabaseConfigured) {
+        setSupabaseSyncState('saving');
+        const supaRes = await fetchSamplesFromSupabase();
+        if (!supaRes.success) {
+          setSupabaseSyncState('error');
+          setSupabaseSyncError(supaRes.error || 'Gagal menarik data dari Supabase.');
+          showToast(`Gagal sinkron dari Supabase: ${supaRes.error}`, 'error');
+          return;
+        }
+
+        const incoming = supaRes.data || [];
+        const completedCount = incoming.filter(s => isSampleBerhasil(s)).length;
+
+        samplesRef.current = incoming;
+        lastSavedSamplesRef.current = incoming;
+        setSamples(incoming);
+        saveSamples(incoming);
+        setUnsavedCount(0);
+        unsavedCountRef.current = 0;
+        setSyncStatus('synced');
+        setSupabaseSyncState('synced');
+        setSupabaseSyncError(null);
+
+        const timeInfo = formatDateTimeZone(supaRes.updatedAt || new Date());
+        setLastSavedAt(timeInfo.displayFull);
+
+        setRealtimePulse(true);
+        setTimeout(() => setRealtimePulse(false), 2000);
+
+        showToast(
+          incoming.length > 0
+            ? `✅ Data Supabase disinkronkan (${incoming.length} sampel, ${completedCount} selesai dicacah) [${timeInfo.displayFull}].`
+            : 'Tabel Supabase berhasil diperiksa (saat ini masih 0 baris).',
+          'success'
+        );
+        return;
+      }
+
       const bustCacheUrl = `/api/samples?_t=${Date.now()}`;
       const res = await fetch(bustCacheUrl, {
         method: 'GET',
@@ -543,6 +714,7 @@ export default function App() {
           const incoming: SampleItem[] = json.data;
           const completedCount = incoming.filter(s => isSampleBerhasil(s)).length;
 
+          samplesRef.current = incoming;
           lastSavedSamplesRef.current = incoming;
           setSamples(incoming);
           saveSamples(incoming);
@@ -554,23 +726,22 @@ export default function App() {
           setLastSavedAt(timeInfo.displayFull);
 
           setRealtimePulse(true);
-          setTimeout(() => setRealtimePulse(false), 2500);
+          setTimeout(() => setRealtimePulse(false), 2000);
 
-          setRealtimeNotice({
-            message: `Progres monitoring berhasil ditarik (${completedCount} sampel selesai dicacah)`,
-            time: timeInfo.displayFull,
-            updater: 'Admin/Pemilik',
-          });
-
-          showToast(`✅ Sync Berhasil! Data termutakhir dari Admin/Pemilik telah diterapkan (${completedCount} selesai dicacah) [${timeInfo.displayFull}].`, 'success');
+          showToast(`✅ Data terbaru berhasil dimuat (${completedCount} selesai dicacah) [${timeInfo.displayFull}].`, 'success');
           return;
         }
       }
-      showToast('Server tidak memiliki data sampel yang tersimpan.', 'info');
+      showToast('Belum ada data tersimpan atau Supabase belum dikonfigurasi.', 'info');
     } catch (err: any) {
-      console.error('Error syncing from server:', err);
-      showToast(`Gagal terhubung ke server untuk sinkronisasi data: ${err.message || 'Periksa jaringan'}`, 'error');
+      console.error('Error refreshing data:', err);
+      if (isSupabaseConfigured) {
+        setSupabaseSyncState('error');
+        setSupabaseSyncError(err?.message || 'Gagal terhubung ke Supabase.');
+      }
+      showToast(`Gagal sinkronisasi data: ${err?.message || 'Periksa jaringan'}`, 'error');
     } finally {
+      setIsRefreshingSupabase(false);
       setIsSyncingServer(false);
     }
   }, [showToast]);
@@ -578,13 +749,27 @@ export default function App() {
   // Handler untuk Restore Data dari File atau Server Snapshot
   const handleRestoreSamples = useCallback(async (restored: SampleItem[], sourceLabel: string) => {
     try {
+      if (isSupabaseConfigured) {
+        setSupabaseSyncState('saving');
+        const supaRes = await replaceAllSamplesInSupabase(restored);
+        if (!supaRes.success) {
+          setSupabaseSyncState('error');
+          setSupabaseSyncError(supaRes.error || 'Gagal menyinkronkan restore ke Supabase.');
+          showToast(`Gagal restore ke Supabase: ${supaRes.error}`, 'error');
+          return false;
+        }
+        setSupabaseSyncState('synced');
+        setSupabaseSyncError(null);
+      }
+
+      samplesRef.current = restored;
       setSamples(restored);
       saveSamples(restored);
       lastSavedSamplesRef.current = restored;
       setUnsavedCount(0);
       unsavedCountRef.current = 0;
 
-      // Sync restored samples to server as active data
+      // Sync restored samples to local server backup as well
       await fetch('/api/samples', {
         method: 'POST',
         headers: {
@@ -599,36 +784,98 @@ export default function App() {
           token: authSession.token,
           email: authSession.email,
         }),
-      });
+      }).catch(() => {});
 
       setSyncStatus('synced');
       const timeInfo = formatDateTimeZone(new Date());
       setLastSavedAt(timeInfo.displayFull);
-      showToast(`✅ Berhasil merestore ${restored.length} sampel dari "${sourceLabel}". Data aktif diperbarui & tersinkronkan ke server (${timeInfo.displayFull}).`, 'success');
+      showToast(`✅ Berhasil merestore ${restored.length} sampel dari "${sourceLabel}" & disinkronkan ke ${isSupabaseConfigured ? 'Supabase' : 'server'} (${timeInfo.displayFull}).`, 'success');
       return true;
     } catch (err) {
       console.error('Error restoring samples:', err);
-      showToast('Gagal menyinkronkan data hasil restore ke server.', 'error');
+      showToast('Gagal menyinkronkan data hasil restore.', 'error');
       return false;
     }
   }, [authSession, showToast]);
 
-  // Update Samples Locally (MANUAL SAVE MODE: TIDAK auto-save ke server)
-  // Setiap checklist atau dropdown berubah, data diupdate di state dan local storage,
-  // dan badge "Simpan Perubahan" akan bertambah.
-  const updateSamplesState = (updater: (prev: SampleItem[]) => SampleItem[], toastMsg?: string) => {
-    setSamples(prev => {
+  // Direct Mutation Sync Helper:
+  // Memperbarui UI seketika dan langsung menjalankan UPDATE / UPSERT / DELETE ke Supabase (bila terkonfigurasi)
+  const updateSamplesState = useCallback(
+    (
+      updater: (prev: SampleItem[]) => SampleItem[],
+      toastMsg?: string,
+      options?: { deletedIds?: string[]; skipAutoSupabase?: boolean }
+    ) => {
+      const prev = samplesRef.current;
       const updated = updater(prev);
+      samplesRef.current = updated;
+      setSamples(updated);
       saveSamples(updated);
+
+      // Compute changed or added rows compared to prev for direct incremental UPSERT
+      const prevMap = new Map(prev.map(s => [s.id, s]));
+      const changedRows = updated.filter(s => prevMap.get(s.id) !== s);
+      const deletedIds = options?.deletedIds || [];
+
+      if (isSupabaseConfigured && !options?.skipAutoSupabase && (changedRows.length > 0 || deletedIds.length > 0)) {
+        setSupabaseSyncState('saving');
+        setSupabaseSyncError(null);
+
+        (async () => {
+          try {
+            if (deletedIds.length > 0) {
+              const delRes = await deleteSamplesFromSupabase(deletedIds);
+              if (!delRes.success) {
+                setSupabaseSyncState('error');
+                setSupabaseSyncError(delRes.error || 'Gagal menghapus data di Supabase.');
+                showToast(`Gagal hapus di Supabase: ${delRes.error}`, 'error');
+                return;
+              }
+            }
+
+            if (changedRows.length > 0) {
+              const upsertRes = await upsertSamplesBatchToSupabase(changedRows);
+              if (!upsertRes.success) {
+                setSupabaseSyncState('error');
+                setSupabaseSyncError(upsertRes.error || 'Gagal menyimpan perubahan ke Supabase.');
+                const diffs = calculateUnsavedCount(samplesRef.current, lastSavedSamplesRef.current);
+                setUnsavedCount(diffs);
+                unsavedCountRef.current = diffs;
+                showToast(`Gagal sinkron ke Supabase: ${upsertRes.error}`, 'error');
+                return;
+              }
+            }
+
+            setSupabaseSyncState('synced');
+            setSupabaseSyncError(null);
+            lastSavedSamplesRef.current = updated;
+            setUnsavedCount(0);
+            unsavedCountRef.current = 0;
+            setSyncStatus('synced');
+            const timeInfo = formatDateTimeZone(new Date());
+            setLastSavedAt(timeInfo.displayFull);
+
+            if (toastMsg) {
+              showToast(`${toastMsg} (Tersinkron ke Supabase)`, 'success');
+            }
+          } catch (err: any) {
+            setSupabaseSyncState('error');
+            setSupabaseSyncError(err?.message || 'Gagal menghubungi Supabase.');
+            showToast(`Gagal sinkron ke Supabase: ${err?.message || 'Periksa koneksi'}`, 'error');
+          }
+        })();
+        return;
+      }
+
       const diffs = calculateUnsavedCount(updated, lastSavedSamplesRef.current);
       setUnsavedCount(diffs);
       unsavedCountRef.current = diffs;
-      return updated;
-    });
-    if (toastMsg) {
-      showToast(`${toastMsg} (Klik 'Simpan Perubahan' untuk simpan ke server)`, 'info');
-    }
-  };
+      if (toastMsg) {
+        showToast(`${toastMsg}${isSupabaseConfigured ? '' : " (Klik 'Simpan Perubahan' untuk simpan ke server)"}`, 'info');
+      }
+    },
+    [calculateUnsavedCount, showToast]
+  );
 
   // Auth & Permissions Handlers
   const handleLoginAccess = async (keyOrPin: string, email?: string) => {
@@ -1103,10 +1350,11 @@ export default function App() {
     }, 'Berhasil menambahkan data simulasi petugas (Budi Pratama & Siti Nurhaliza)!');
   };
 
-  // Reset to default with server reset
+  // Reset to default with Supabase & server reset
   const handleResetData = async () => {
     if (window.confirm('Apakah Anda yakin ingin memuat ulang data awal dari file Excel/CSV Erika? Perubahan checklist yang tersimpan akan dikembalikan ke awal.')) {
-      localStorage.clear();
+      localStorage.removeItem('sitasi_2026_monitoring_samples_v1');
+      localStorage.removeItem('sitasi_2026_active_petugas');
       setIsLoading(true);
       try {
         await fetch('/api/reset-data', { method: 'POST' }).catch(() => {});
@@ -1114,18 +1362,43 @@ export default function App() {
         const text = await response.text();
         const rows = parseCSV(text);
         const parsed = parseSitasiData(rows, 'Erika');
+
+        if (isSupabaseConfigured) {
+          setSupabaseSyncState('saving');
+          const supaRes = await replaceAllSamplesInSupabase(parsed);
+          if (!supaRes.success) {
+            setSupabaseSyncState('error');
+            setSupabaseSyncError(supaRes.error || 'Gagal mereset data di Supabase.');
+            showToast(`Reset lokal berhasil, tetapi gagal sinkron ke Supabase: ${supaRes.error}`, 'error');
+          } else {
+            setSupabaseSyncState('synced');
+            setSupabaseSyncError(null);
+          }
+        }
+
+        samplesRef.current = parsed;
+        lastSavedSamplesRef.current = parsed;
         setSamples(parsed);
         saveSamples(parsed);
+        setUnsavedCount(0);
+        unsavedCountRef.current = 0;
         setActivePetugas('all');
         saveActivePetugas('all');
         setSelectedIds(new Set());
-        // Seed server with initial data
+        setLastSavedAt(formatDateTimeZone(new Date()).displayFull);
+
+        // Seed Express backup as well
         await fetch('/api/samples', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ samples: parsed }),
+          headers: {
+            'Content-Type': 'application/json',
+            'x-auth-role': authSession.role,
+            'x-auth-token': authSession.token || '',
+            'x-auth-email': authSession.email || '',
+          },
+          body: JSON.stringify({ samples: parsed, role: authSession.role, token: authSession.token, email: authSession.email }),
         }).catch(() => {});
-        showToast('Data berhasil dikembalikan ke sampel default Erika dan disinkronkan ke server.', 'info');
+        showToast(`Data berhasil dikembalikan ke sampel default Erika dan disinkronkan ke ${isSupabaseConfigured ? 'Supabase' : 'server'}.`, 'info');
       } catch (err) {
         console.error('Reset error:', err);
       } finally {
@@ -1234,6 +1507,7 @@ export default function App() {
           return {
             ...s,
             ...updated,
+            updatedAt: new Date().toISOString(),
           };
         }
         return s;
@@ -1241,23 +1515,50 @@ export default function App() {
     }, `Perubahan sampel ${selectedSample.nus} berhasil disimpan.`);
   };
 
-  // Import handler from upload modal (supports multiple files simultaneously)
+  // Delete single sample (executes DELETE query to Supabase)
+  const handleDeleteSample = useCallback((id: string) => {
+    updateSamplesState(
+      prev => prev.filter(s => s.id !== id),
+      'Sampel berhasil dihapus.',
+      { deletedIds: [id] }
+    );
+  }, [updateSamplesState]);
+
+  // Import handler from upload modal (supports multiple files & Supabase batched upsert)
   const handleImportMultiple = (
     allSamples: SampleItem[],
     mode: 'append' | 'replace-all',
-    summaryMsg: string
+    summaryMsg: string,
+    syncedToSupabase?: boolean
   ) => {
-    updateSamplesState(prev => {
-      if (mode === 'replace-all') {
-        return allSamples;
-      }
-      // append mode: merge by ID or append
-      const existingMap = new Map(prev.map(s => [s.id, s]));
-      allSamples.forEach(s => {
-        existingMap.set(s.id, s);
-      });
-      return Array.from(existingMap.values());
-    }, summaryMsg);
+    updateSamplesState(
+      prev => {
+        if (mode === 'replace-all') {
+          return allSamples;
+        }
+        // append mode: merge by ID or append
+        const existingMap = new Map(prev.map(s => [s.id, s]));
+        allSamples.forEach(s => {
+          existingMap.set(s.id, s);
+        });
+        return Array.from(existingMap.values());
+      },
+      undefined,
+      { skipAutoSupabase: Boolean(syncedToSupabase) }
+    );
+
+    if (syncedToSupabase) {
+      lastSavedSamplesRef.current = samplesRef.current;
+      setUnsavedCount(0);
+      unsavedCountRef.current = 0;
+      setSyncStatus('synced');
+      setSupabaseSyncState('synced');
+      setSupabaseSyncError(null);
+      const timeInfo = formatDateTimeZone(new Date());
+      setLastSavedAt(timeInfo.displayFull);
+    }
+
+    showToast(summaryMsg, 'success');
 
     // If all uploaded files belong to one officer, switch to that officer; otherwise 'all'
     const uniqueOfficers = Array.from(new Set(allSamples.map(s => s.petugas)));
@@ -1349,6 +1650,10 @@ export default function App() {
         onOpenAccessModal={() => setIsAccessModalOpen(true)}
         onOpenLoginModal={() => setIsLoginModalOpen(true)}
         onLogout={handleLogoutAccess}
+        supabaseSyncState={supabaseSyncState}
+        supabaseSyncError={supabaseSyncError}
+        isRefreshingSupabase={isRefreshingSupabase}
+        onRefreshSupabase={handleRefreshFromSupabase}
       />
 
       {/* Main Content Body */}
@@ -1358,22 +1663,75 @@ export default function App() {
           : 'max-w-7xl px-4 sm:px-6 lg:px-8'
       }`}>
         
+        {/* Clear Notification if Supabase env vars are missing */}
+        {!isSupabaseConfigured && showSupabaseConfigBanner && (
+          <div className="bg-amber-50 border border-amber-300 text-amber-950 px-4 py-3 rounded-xl flex items-start justify-between gap-3 text-xs shadow-xs">
+            <div className="flex items-start space-x-3">
+              <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <p className="font-bold text-amber-950">
+                  Konfigurasi Supabase Belum Lengkap ({supabaseConfigStatus.errorMessage})
+                </p>
+                <p className="text-amber-900 leading-relaxed">
+                  Untuk mengaktifkan database utama Supabase secara permanen: tambahkan <code className="bg-amber-100 px-1 py-0.5 rounded font-mono">VITE_SUPABASE_URL</code> dan <code className="bg-amber-100 px-1 py-0.5 rounded font-mono">VITE_SUPABASE_ANON_KEY</code> pada environment variables / Secrets, lalu jalankan skrip <code className="bg-amber-100 px-1 py-0.5 rounded font-mono">supabase_schema.sql</code> di SQL Editor Supabase. Dashboard tetap berjalan aman menggunakan penyimpanan cadangan lokal/server.
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowSupabaseConfigBanner(false)}
+              className="text-amber-700 hover:text-amber-950 p-1 rounded hover:bg-amber-100 cursor-pointer shrink-0"
+              title="Tutup pemberitahuan"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        )}
+
+        {/* Clear Notification if Supabase Query/Sync Failed */}
+        {isSupabaseConfigured && supabaseSyncState === 'error' && supabaseSyncError && (
+          <div className="bg-rose-50 border border-rose-300 text-rose-950 px-4 py-3 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs shadow-xs">
+            <div className="flex items-start space-x-2.5 max-w-3xl">
+              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+              <div>
+                <span className="font-bold block">Gagal Sinkronisasi Supabase:</span>
+                <span className="text-rose-800 break-words">{supabaseSyncError}</span>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={handleRefreshFromSupabase}
+              disabled={isRefreshingSupabase}
+              className="inline-flex items-center px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs cursor-pointer"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 mr-1.5 ${isRefreshingSupabase ? 'animate-spin' : ''}`} />
+              <span>Coba Sinkronkan Ulang</span>
+            </button>
+          </div>
+        )}
+
         {isLoading ? (
           <div className="bg-white rounded-2xl p-16 text-center border border-slate-200 shadow-xs">
             <div className="w-10 h-10 border-4 border-emerald-500 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
             <h3 className="text-base font-bold text-slate-800">Memuat Data Sampel SITASI 2026...</h3>
-            <p className="text-xs text-slate-500 mt-1">Menguraikan 435 sampel UTP resmi Kubu Raya, koordinat lokasi, dan status lapangan...</p>
+            <p className="text-xs text-slate-500 mt-1">
+              {isSupabaseConfigured
+                ? 'Mengambil data terbaru langsung dari database Supabase...'
+                : 'Menguraikan sampel UTP Kubu Raya, koordinat lokasi, dan status lapangan...'}
+            </p>
           </div>
         ) : (
           <>
-            {/* Server Synchronization Status Bar with Click-to-Save Status & Realtime Sync Indicator */}
+            {/* Server Synchronization Status Bar with Last Updated (WIB) */}
             <div className={`flex flex-wrap items-center justify-between gap-2 bg-white px-4 py-2.5 rounded-xl border transition-all duration-300 shadow-2xs text-xs ${
               realtimePulse ? 'border-emerald-400 ring-2 ring-emerald-200 bg-emerald-50/30' : 'border-slate-200'
             }`}>
               <div className="flex items-center space-x-2.5 flex-wrap gap-y-1">
                 <span className={`inline-block w-2.5 h-2.5 rounded-full ${
-                  isSavingToServer 
+                  isSavingToServer || supabaseSyncState === 'saving'
                     ? 'bg-amber-500 animate-ping' 
+                    : supabaseSyncState === 'error'
+                    ? 'bg-rose-500'
                     : unsavedCount > 0 
                     ? 'bg-amber-500 animate-pulse' 
                     : syncStatus === 'synced' 
@@ -1381,14 +1739,18 @@ export default function App() {
                     : 'bg-slate-400'
                 }`} />
                 <span className="font-bold text-slate-800">
-                  {isSavingToServer ? (
-                    '🟡 Mengirim & Menyimpan ke Server...'
+                  {isSavingToServer || supabaseSyncState === 'saving' ? (
+                    '🟡 Menyimpan perubahan...'
+                  ) : supabaseSyncState === 'error' ? (
+                    <span className="text-rose-700 font-bold">🔴 Gagal sinkron ke Supabase</span>
                   ) : unsavedCount > 0 ? (
                     <span className="text-amber-800 font-bold">
-                      ⚠️ Ada {unsavedCount} perubahan belum disimpan ke server! (Klik tombol "Simpan Perubahan" di bawah)
+                      ⚠️ Ada {unsavedCount} perubahan belum disimpan! (Klik tombol "Simpan Perubahan" di bawah)
                     </span>
+                  ) : isSupabaseConfigured ? (
+                    '🟢 Tersinkron ke Supabase'
                   ) : syncStatus === 'synced' ? (
-                    '🟢 Seluruh data tersimpan di server'
+                    '🟢 Seluruh data tersimpan di server lokal'
                   ) : (
                     '⚪ Mode Offline (Tersimpan Lokal)'
                   )}
@@ -1620,6 +1982,8 @@ export default function App() {
           setSelectedSample(null);
         }}
         onSave={handleSaveDetail}
+        onDelete={handleDeleteSample}
+        canEdit={authSession.canEdit}
         cadanganOptions={cadanganOptions}
         onOpenBeritaAcara={() => setIsBeritaAcaraOpen(true)}
       />

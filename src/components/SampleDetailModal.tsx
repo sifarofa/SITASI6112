@@ -26,7 +26,8 @@ import {
   XCircle, 
   User, 
   Layers, 
-  FileText 
+  FileText,
+  Trash2
 } from 'lucide-react';
 
 interface SampleDetailModalProps {
@@ -34,6 +35,8 @@ interface SampleDetailModalProps {
   isOpen: boolean;
   onClose: () => void;
   onSave: (updated: Partial<SampleItem>) => void;
+  onDelete?: (id: string) => void;
+  canEdit?: boolean;
   cadanganOptions: SampleItem[];
   onOpenBeritaAcara?: () => void;
 }
@@ -43,6 +46,8 @@ export const SampleDetailModal: React.FC<SampleDetailModalProps> = ({
   isOpen,
   onClose,
   onSave,
+  onDelete,
+  canEdit = true,
   cadanganOptions,
   onOpenBeritaAcara,
 }) => {
@@ -560,22 +565,43 @@ export const SampleDetailModal: React.FC<SampleDetailModalProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="bg-slate-50 px-6 py-3.5 border-t border-slate-200 flex items-center justify-end space-x-3">
-          <button
-            type="button"
-            onClick={onClose}
-            className="px-4 py-2 text-xs font-semibold rounded-lg text-slate-700 hover:bg-slate-200 transition-colors cursor-pointer"
-          >
-            Batal
-          </button>
-          <button
-            type="button"
-            onClick={handleSave}
-            className="inline-flex items-center px-4 py-2 text-xs font-bold rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white shadow-xs transition-colors cursor-pointer"
-          >
-            <Check className="w-4 h-4 mr-1.5" />
-            Simpan Perubahan
-          </button>
+        <div className="bg-slate-50 px-6 py-3.5 border-t border-slate-200 flex items-center justify-between gap-3">
+          <div>
+            {canEdit && onDelete && (
+              <button
+                type="button"
+                onClick={() => {
+                  if (window.confirm(`Hapus sampel NUS ${sample.nus} (${sample.namaUTP}) secara permanen dari dashboard & Supabase?`)) {
+                    onDelete(sample.id);
+                    onClose();
+                  }
+                }}
+                className="inline-flex items-center px-3 py-2 text-xs font-semibold rounded-lg text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 transition-colors cursor-pointer"
+              >
+                <Trash2 className="w-3.5 h-3.5 mr-1.5" />
+                Hapus Sampel
+              </button>
+            )}
+          </div>
+          <div className="flex items-center space-x-3">
+            <button
+              type="button"
+              onClick={onClose}
+              className="px-4 py-2 text-xs font-semibold rounded-lg text-slate-700 hover:bg-slate-200 transition-colors cursor-pointer"
+            >
+              Batal
+            </button>
+            {canEdit && (
+              <button
+                type="button"
+                onClick={handleSave}
+                className="inline-flex items-center px-4 py-2 text-xs font-bold rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white shadow-xs transition-colors cursor-pointer"
+              >
+                <Check className="w-4 h-4 mr-1.5" />
+                Simpan Perubahan
+              </button>
+            )}
+          </div>
         </div>
 
       </div>

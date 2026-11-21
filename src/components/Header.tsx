@@ -14,7 +14,11 @@ import {
   Maximize2,
   Minimize2,
   ShieldCheck,
-  Lock
+  Lock,
+  Database,
+  RefreshCw,
+  AlertCircle,
+  Loader2
 } from 'lucide-react';
 import { PetugasSummary, UserAuthSession } from '../types/sitasi';
 import { OfficerSelect } from './OfficerSelect';
@@ -41,6 +45,10 @@ interface HeaderProps {
   onOpenAccessModal?: () => void;
   onOpenLoginModal?: () => void;
   onLogout?: () => void;
+  supabaseSyncState?: 'synced' | 'saving' | 'error' | 'unconfigured';
+  supabaseSyncError?: string | null;
+  isRefreshingSupabase?: boolean;
+  onRefreshSupabase?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -64,6 +72,10 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenAccessModal,
   onOpenLoginModal,
   onLogout,
+  supabaseSyncState = 'unconfigured',
+  supabaseSyncError = null,
+  isRefreshingSupabase = false,
+  onRefreshSupabase,
 }) => {
   const [showExportMenu, setShowExportMenu] = React.useState(false);
   const activeSummary = petugasList.find(p => p.nama === activePetugas);
@@ -91,6 +103,42 @@ export const Header: React.FC<HeaderProps> = ({
                     LAYAR PENUH ({orientation === 'landscape' ? 'LEBAR' : 'TEGAK'})
                   </span>
                 )}
+                {/* Indikator Status Sinkronisasi Supabase di Header */}
+                <span
+                  title={
+                    supabaseSyncState === 'error'
+                      ? supabaseSyncError || 'Gagal sinkron ke Supabase'
+                      : supabaseSyncState === 'unconfigured'
+                      ? 'VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY belum diisi'
+                      : 'Status sinkronisasi database Supabase'
+                  }
+                  className={`inline-flex items-center gap-1.5 text-[10px] font-bold px-2 py-0.5 rounded border ${
+                    supabaseSyncState === 'saving'
+                      ? 'bg-amber-500/20 text-amber-200 border-amber-400/40'
+                      : supabaseSyncState === 'synced'
+                      ? 'bg-emerald-500/20 text-emerald-200 border-emerald-400/40'
+                      : supabaseSyncState === 'error'
+                      ? 'bg-rose-500/20 text-rose-200 border-rose-400/40'
+                      : 'bg-slate-700/70 text-slate-300 border-slate-600'
+                  }`}
+                >
+                  {supabaseSyncState === 'saving' ? (
+                    <Loader2 className="w-3 h-3 animate-spin text-amber-300" />
+                  ) : supabaseSyncState === 'synced' ? (
+                    <Database className="w-3 h-3 text-emerald-300" />
+                  ) : (
+                    <AlertCircle className={`w-3 h-3 ${supabaseSyncState === 'error' ? 'text-rose-300' : 'text-amber-300'}`} />
+                  )}
+                  <span>
+                    {supabaseSyncState === 'saving'
+                      ? 'Menyimpan perubahan...'
+                      : supabaseSyncState === 'synced'
+                      ? 'Tersinkron ke Supabase'
+                      : supabaseSyncState === 'error'
+                      ? 'Gagal sinkron'
+                      : 'Supabase Belum Diatur'}
+                  </span>
+                </span>
               </div>
               <h1 className="text-lg sm:text-xl font-bold tracking-tight text-white flex items-center gap-1.5">
                 Monitoring Progres Petugas Lapangan
@@ -329,6 +377,25 @@ export const Header: React.FC<HeaderProps> = ({
                 ) : (
                   <Maximize2 className="w-4 h-4 text-emerald-400" />
                 )}
+              </button>
+            )}
+
+            {/* Tombol Sinkronkan Ulang / Refresh Data dari Supabase */}
+            {onRefreshSupabase && (
+              <button
+                type="button"
+                onClick={onRefreshSupabase}
+                disabled={isRefreshingSupabase}
+                title="Tarik data terbaru secara manual dari database Supabase"
+                className="inline-flex items-center text-xs font-semibold px-2.5 py-1.5 rounded-lg bg-sky-600/90 hover:bg-sky-500 text-white border border-sky-400/40 shadow-sm transition-all cursor-pointer disabled:opacity-60"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 mr-1.5 ${isRefreshingSupabase ? 'animate-spin' : ''}`} />
+                <span className="hidden lg:inline">
+                  {isRefreshingSupabase ? 'Menyinkronkan...' : 'Sinkronkan Ulang / Refresh Data'}
+                </span>
+                <span className="lg:hidden">
+                  {isRefreshingSupabase ? 'Refresh...' : 'Refresh Data'}
+                </span>
               </button>
             )}
 

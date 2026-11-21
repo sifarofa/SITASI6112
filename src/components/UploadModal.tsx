@@ -11,7 +11,10 @@ import {
   Plus,
   Trash2,
   Users,
-  CheckCheck
+  CheckCheck,
+  Database,
+  CloudUpload,
+  AlertTriangle
 } from 'lucide-react';
 import { SampleItem } from '../types/sitasi';
 import { 
@@ -20,6 +23,15 @@ import {
   parseSitasiData, 
   extractPetugasFromFilename 
 } from '../utils/csvParser';
+import {
+  isSupabaseConfigured,
+  supabaseConfigStatus,
+  upsertSamplesBatchToSupabase,
+  replaceAllSamplesInSupabase,
+  deduplicateSamplesForUpsert,
+  SupabaseSyncProgress,
+  SUPABASE_UPSERT_BATCH_SIZE,
+} from '../lib/supabase';
 
 export interface UploadedFileItem {
   id: string;
@@ -37,7 +49,12 @@ export interface UploadedFileItem {
 interface UploadModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onImportMultiple: (allSamples: SampleItem[], mode: 'append' | 'replace-all', summaryMsg: string) => void;
+  onImportMultiple: (
+    allSamples: SampleItem[],
+    mode: 'append' | 'replace-all',
+    summaryMsg: string,
+    syncedToSupabase?: boolean
+  ) => void;
   existingPetugasList: string[];
 }
 
@@ -52,6 +69,9 @@ export const UploadModal: React.FC<UploadModalProps> = ({
   const [dragActive, setDragActive] = useState(false);
   const [fileList, setFileList] = useState<UploadedFileItem[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isSyncingSupabase, setIsSyncingSupabase] = useState(false);
+  const [syncProgress, setSyncProgress] = useState<SupabaseSyncProgress | null>(null);
+  const [supabaseError, setSupabaseError] = useState<string>('');
   const [globalError, setGlobalError] = useState('');
   const [importMode, setImportMode] = useState<'append' | 'replace-all'>('append');
 
@@ -174,15 +194,18 @@ export const UploadModal: React.FC<UploadModalProps> = ({
     setFileList(prev => prev.filter(item => item.id !== id));
   };
 
-  // Confirm import of all files
-  const handleConfirmImport = () => {
+  // Confirm import of all files and sync to Supabase in batches (max 500 rows/request)
+  const handleConfirmImport = async () => {
     const validFiles = fileList.filter(f => !f.errorMsg && f.samples.length > 0);
     if (validFiles.length === 0) {
       setGlobalError('Tidak ada file dengan data sampel yang valid untuk diimpor.');
       return;
     }
 
-    // Combine all samples
+    setGlobalError('');
+    setSupabaseError('');
+
+    // Combine & normalize all samples
     const combinedSamples: SampleItem[] = [];
     const officerNames: string[] = [];
 
@@ -195,12 +218,46 @@ export const UploadModal: React.FC<UploadModalProps> = ({
         combinedSamples.push({
           ...s,
           petugas: officer,
+          updatedAt: new Date().toISOString(),
         });
       });
     });
 
-    const summaryMsg = `Berhasil mengimpor ${combinedSamples.length} sampel dari ${validFiles.length} file (${officerNames.join(', ')})!`;
-    onImportMultiple(combinedSamples, importMode, summaryMsg);
+    const dedupedSamples = deduplicateSamplesForUpsert(combinedSamples);
+
+    if (isSupabaseConfigured) {
+      setIsSyncingSupabase(true);
+      setSyncProgress({
+        currentBatch: 0,
+        totalBatches: Math.max(1, Math.ceil(dedupedSamples.length / SUPABASE_UPSERT_BATCH_SIZE)),
+        syncedRows: 0,
+        totalRows: dedupedSamples.length,
+        percentage: 0,
+      });
+
+      const syncResult =
+        importMode === 'replace-all'
+          ? await replaceAllSamplesInSupabase(dedupedSamples, (prog) => setSyncProgress(prog))
+          : await upsertSamplesBatchToSupabase(dedupedSamples, (prog) => setSyncProgress(prog));
+
+      setIsSyncingSupabase(false);
+
+      if (!syncResult.success) {
+        setSupabaseError(
+          syncResult.error ||
+            'Gagal menyinkronkan data ke Supabase. Periksa kesesuaian kolom tabel sitasi_samples.'
+        );
+        return;
+      }
+
+      const summaryMsg = `Berhasil mengimpor & menyinkronkan ${dedupedSamples.length} baris ke Supabase dari ${validFiles.length} file (${officerNames.join(', ')})!`;
+      onImportMultiple(dedupedSamples, importMode, summaryMsg, true);
+      onClose();
+      return;
+    }
+
+    const summaryMsg = `Berhasil mengimpor ${dedupedSamples.length} sampel dari ${validFiles.length} file (${officerNames.join(', ')}) secara lokal!`;
+    onImportMultiple(dedupedSamples, importMode, summaryMsg, false);
     onClose();
   };
 
@@ -281,11 +338,65 @@ export const UploadModal: React.FC<UploadModalProps> = ({
             </p>
           </div>
 
+          {/* Supabase Connection Status Notice */}
+          {isSupabaseConfigured ? (
+            <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-xs text-emerald-900 flex items-start space-x-2.5">
+              <Database className="w-4 h-4 text-emerald-600 mt-0.5 shrink-0" />
+              <div>
+                <span className="font-bold">Terhubung ke Supabase:</span> Data yang diunggah akan langsung di-<em>upsert</em> secara otomatis dalam batch (maks. {SUPABASE_UPSERT_BATCH_SIZE} baris/request) ke tabel <code>sitasi_samples</code>.
+              </div>
+            </div>
+          ) : (
+            <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-900 flex items-start space-x-2.5">
+              <AlertTriangle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
+              <div>
+                <span className="font-bold">Supabase Belum Dikonfigurasi:</span> {supabaseConfigStatus.errorMessage} File tetap dapat diimpor ke dashboard lokal, namun tidak akan tersinkronisasi ke database Supabase sampai <code>VITE_SUPABASE_URL</code> dan <code>VITE_SUPABASE_ANON_KEY</code> diatur.
+              </div>
+            </div>
+          )}
+
           {/* Processing Indicator */}
           {isProcessing && (
             <div className="p-3 bg-slate-50 rounded-lg text-center text-xs text-slate-600 animate-pulse font-medium flex items-center justify-center gap-2">
               <div className="w-3.5 h-3.5 border-2 border-emerald-600 border-t-transparent rounded-full animate-spin"></div>
               <span>Membaca dan memproses file yang diunggah...</span>
+            </div>
+          )}
+
+          {/* Supabase Batch Sync Progress Bar */}
+          {isSyncingSupabase && syncProgress && (
+            <div className="p-4 bg-sky-50 border border-sky-200 rounded-xl space-y-2">
+              <div className="flex items-center justify-between text-xs font-bold text-sky-900">
+                <span className="flex items-center gap-2">
+                  <CloudUpload className="w-4 h-4 text-sky-600 animate-bounce" />
+                  <span>Menyinkronkan ke Supabase (Batch {syncProgress.currentBatch}/{syncProgress.totalBatches})...</span>
+                </span>
+                <span className="font-mono text-sky-700">
+                  {syncProgress.syncedRows} / {syncProgress.totalRows} baris ({syncProgress.percentage}%)
+                </span>
+              </div>
+              <div className="w-full h-2.5 bg-sky-200/70 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-gradient-to-r from-sky-500 to-emerald-500 transition-all duration-300"
+                  style={{ width: `${Math.max(4, syncProgress.percentage)}%` }}
+                />
+              </div>
+              <p className="text-[11px] text-sky-700">
+                Mohon tunggu, sedang mengirim chunk maksimal {SUPABASE_UPSERT_BATCH_SIZE} baris per request agar tidak timeout...
+              </p>
+            </div>
+          )}
+
+          {/* Detailed Supabase Sync Error Message */}
+          {supabaseError && (
+            <div className="p-3.5 bg-rose-50 border border-rose-300 rounded-xl text-xs text-rose-900 space-y-1">
+              <div className="flex items-start space-x-2 font-bold">
+                <AlertCircle className="w-4 h-4 text-rose-600 mt-0.5 shrink-0" />
+                <span>Gagal Sinkronisasi Upload ke Supabase</span>
+              </div>
+              <p className="pl-6 text-[11px] text-rose-800 leading-relaxed break-words">
+                {supabaseError}
+              </p>
             </div>
           )}
 
@@ -464,23 +575,30 @@ export const UploadModal: React.FC<UploadModalProps> = ({
           <div className="flex items-center space-x-2">
             <button
               type="button"
+              disabled={isSyncingSupabase}
               onClick={onClose}
-              className="px-4 py-2 text-xs font-semibold rounded-lg text-slate-700 hover:bg-slate-200 transition-colors cursor-pointer"
+              className="px-4 py-2 text-xs font-semibold rounded-lg text-slate-700 hover:bg-slate-200 transition-colors cursor-pointer disabled:opacity-50"
             >
               Batal
             </button>
             <button
               type="button"
-              disabled={validFiles.length === 0}
+              disabled={validFiles.length === 0 || isSyncingSupabase || isProcessing}
               onClick={handleConfirmImport}
               className={`inline-flex items-center px-4 py-2 text-xs font-bold rounded-lg text-white shadow-xs transition-colors cursor-pointer ${
-                validFiles.length > 0 
+                validFiles.length > 0 && !isSyncingSupabase && !isProcessing
                   ? 'bg-emerald-600 hover:bg-emerald-700' 
                   : 'bg-slate-300 cursor-not-allowed'
               }`}
             >
               <CheckCircle2 className="w-4 h-4 mr-1.5" />
-              <span>Impor {totalCombinedSamples} Sampel ({validFiles.length} File)</span>
+              <span>
+                {isSyncingSupabase
+                  ? 'Menyinkronkan ke Supabase...'
+                  : isSupabaseConfigured
+                  ? `Impor & Sinkronkan ${totalCombinedSamples} Sampel`
+                  : `Impor ${totalCombinedSamples} Sampel (${validFiles.length} File)`}
+              </span>
             </button>
           </div>
         </div>
