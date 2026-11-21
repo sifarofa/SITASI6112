@@ -177,8 +177,24 @@ export default function App() {
       const saved = localStorage.getItem('sitasi_auth_session');
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (parsed && parsed.role) {
-          return parsed;
+        if (
+          parsed &&
+          typeof parsed === 'object' &&
+          (parsed.role === 'owner' || parsed.role === 'editor' || parsed.role === 'guest')
+        ) {
+          return {
+            role: parsed.role,
+            email: typeof parsed.email === 'string' ? parsed.email : undefined,
+            displayName:
+              typeof parsed.displayName === 'string' && parsed.displayName
+                ? parsed.displayName
+                : typeof parsed.email === 'string' && parsed.email
+                ? parsed.email
+                : 'Pengguna',
+            token: typeof parsed.token === 'string' ? parsed.token : undefined,
+            canEdit: Boolean(parsed.canEdit ?? (parsed.role === 'owner' || parsed.role === 'editor')),
+            loginAt: typeof parsed.loginAt === 'string' ? parsed.loginAt : undefined,
+          };
         }
       }
     } catch {}

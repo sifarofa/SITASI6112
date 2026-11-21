@@ -20,13 +20,12 @@ export const QuickNusModal: React.FC<QuickNusModalProps> = ({
   onReset,
   allSamples,
 }) => {
-  if (!isOpen || !sample) return null;
-
-  const isUtama = sample.statusSampel === 'U';
+  const isUtama = sample?.statusSampel === 'U';
   const [selectedNus, setSelectedNus] = useState<string>('');
   const [customNus, setCustomNus] = useState<string>('');
 
   useEffect(() => {
+    if (!sample) return;
     const current = sample.nusPengganti || sample.nusPenggantiAwal || '';
     setSelectedNus(current);
     setCustomNus(current);
@@ -34,6 +33,7 @@ export const QuickNusModal: React.FC<QuickNusModalProps> = ({
 
   // Candidates in same NKS
   const candidateOptions = useMemo(() => {
+    if (!sample) return [];
     if (isUtama) {
       // Find Cadangan in same NKS
       return allSamples.filter(s => s.statusSampel === 'C' && s.nks === sample.nks);
@@ -42,6 +42,8 @@ export const QuickNusModal: React.FC<QuickNusModalProps> = ({
       return allSamples.filter(s => s.statusSampel === 'U' && s.nks === sample.nks);
     }
   }, [allSamples, sample, isUtama]);
+
+  if (!isOpen || !sample) return null;
 
   const prioSample = getEffectiveKomoditasPrioritas(sample);
   const subsektorSample = detectSubsektor(sample.komoditasPrioritas, sample.komoditas);

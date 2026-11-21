@@ -64,8 +64,6 @@ export const UploadModal: React.FC<UploadModalProps> = ({
   onImportMultiple,
   existingPetugasList,
 }) => {
-  if (!isOpen) return null;
-
   const [dragActive, setDragActive] = useState(false);
   const [fileList, setFileList] = useState<UploadedFileItem[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -76,6 +74,8 @@ export const UploadModal: React.FC<UploadModalProps> = ({
   const [importMode, setImportMode] = useState<'append' | 'replace-all'>('append');
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  if (!isOpen) return null;
 
   // Process an individual file and return parsed item
   const parseSingleFile = async (file: File): Promise<UploadedFileItem> => {

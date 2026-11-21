@@ -51,14 +51,14 @@ export const SampleDetailModal: React.FC<SampleDetailModalProps> = ({
   cadanganOptions,
   onOpenBeritaAcara,
 }) => {
-  if (!isOpen || !sample) return null;
-
-  const [status, setStatus] = useState<SurveyProgressStatus>(sample.progressStatus);
-  const [hasilFasih, setHasilFasih] = useState<string>(sample.hasilPendataanFasih || mapSurveyStatusToFasih(sample.progressStatus));
-  const [tanggal, setTanggal] = useState<string>(sample.tanggalCacah || new Date().toISOString().split('T')[0]);
-  const [catatan, setCatatan] = useState<string>(sample.catatanPetugas || '');
-  const [nusPengganti, setNusPengganti] = useState<string>(sample.nusPengganti || sample.nusPenggantiAwal || '');
-  const [petugas, setPetugas] = useState<string>(sample.petugas || 'Erika');
+  const [status, setStatus] = useState<SurveyProgressStatus>(sample?.progressStatus || 'BELUM');
+  const [hasilFasih, setHasilFasih] = useState<string>(
+    sample?.hasilPendataanFasih || mapSurveyStatusToFasih(sample?.progressStatus || 'BELUM')
+  );
+  const [tanggal, setTanggal] = useState<string>(sample?.tanggalCacah || new Date().toISOString().split('T')[0]);
+  const [catatan, setCatatan] = useState<string>(sample?.catatanPetugas || '');
+  const [nusPengganti, setNusPengganti] = useState<string>(sample?.nusPengganti || sample?.nusPenggantiAwal || '');
+  const [petugas, setPetugas] = useState<string>(sample?.petugas || 'Erika');
 
   const prioCurrent = useMemo(() => {
     return sample ? getEffectiveKomoditasPrioritas(sample) : '';
@@ -88,6 +88,8 @@ export const SampleDetailModal: React.FC<SampleDetailModalProps> = ({
       setPetugas(sample.petugas || 'Erika');
     }
   }, [sample]);
+
+  if (!isOpen || !sample) return null;
 
   const handleHasilFasihChange = (val: string) => {
     setHasilFasih(val);

@@ -81,8 +81,6 @@ export const BeritaAcaraModal: React.FC<BeritaAcaraModalProps> = ({
   samples,
   activePetugas,
 }) => {
-  if (!isOpen) return null;
-
   const [activeTab, setActiveTab] = useState<'preview' | 'template' | 'rows'>('preview');
 
   // Form & Template parameters
@@ -125,6 +123,7 @@ export const BeritaAcaraModal: React.FC<BeritaAcaraModalProps> = ({
 
   // Load saved template config from server (/api/berita-acara) or localStorage
   useEffect(() => {
+    if (!isOpen) return;
     const loadConfig = async () => {
       let loadedConfig: SavedTemplateConfig | null = null;
 
@@ -245,7 +244,7 @@ export const BeritaAcaraModal: React.FC<BeritaAcaraModalProps> = ({
     };
 
     loadConfig();
-  }, [samples, utamaSamples, cadanganSamples]);
+  }, [isOpen, samples, utamaSamples, cadanganSamples]);
 
   // Save template configuration to localStorage and server
   const handleSaveTemplateConfig = async () => {
@@ -490,6 +489,8 @@ export const BeritaAcaraModal: React.FC<BeritaAcaraModalProps> = ({
   }, [cadanganSamples, activeSelectedUtama, filterDifferentOnly]);
 
   const displayRowCount = Math.max(rows.length, 5);
+
+  if (!isOpen) return null;
 
   return (
     <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/70 backdrop-blur-xs flex items-center justify-center p-2 sm:p-4 print:p-0 print:bg-white print:static">
