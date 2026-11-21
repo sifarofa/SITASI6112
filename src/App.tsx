@@ -42,10 +42,12 @@ import {
   exportRekapToCSV
 } from './utils/export';
 import { formatDateTimeZone, formatShortTimeZone } from './utils/timezone';
+import { postJsonWithRetry } from './utils/api';
 import {
-  supabase,
-  isSupabaseConfigured,
-  supabaseConfigStatus,
+  getSupabaseClient,
+  getIsSupabaseConfigured,
+  getSupabaseConfigStatus,
+  initSupabaseRuntimeConfig,
   SUPABASE_SAMPLES_TABLE,
   fetchSamplesFromSupabase,
   upsertSamplesBatchToSupabase,
@@ -139,14 +141,15 @@ export default function App() {
   const [orientation, setOrientation] = useState<'landscape' | 'portrait'>('landscape');
 
   // Server & Supabase synchronization state
+  const [supabaseReady, setSupabaseReady] = useState<boolean>(() => getIsSupabaseConfigured());
   const [syncStatus, setSyncStatus] = useState<'synced' | 'saving' | 'offline'>('synced');
   const [supabaseSyncState, setSupabaseSyncState] = useState<'synced' | 'saving' | 'error' | 'unconfigured'>(
-    isSupabaseConfigured ? 'synced' : 'unconfigured'
+    getIsSupabaseConfigured() ? 'synced' : 'unconfigured'
   );
   const [supabaseSyncError, setSupabaseSyncError] = useState<string | null>(
-    supabaseConfigStatus.errorMessage
+    getSupabaseConfigStatus().errorMessage
   );
-  const [showSupabaseConfigBanner, setShowSupabaseConfigBanner] = useState<boolean>(!isSupabaseConfigured);
+  const [showSupabaseConfigBanner, setShowSupabaseConfigBanner] = useState<boolean>(!getIsSupabaseConfigured());
   const [isRefreshingSupabase, setIsRefreshingSupabase] = useState<boolean>(false);
   const [unsavedCount, setUnsavedCount] = useState<number>(0);
   const [isSavingToServer, setIsSavingToServer] = useState<boolean>(false);
@@ -170,15 +173,15 @@ export default function App() {
   // Authentication & Permissions state (Owner, Editor, or Guest)
   // Default: Mode Tamu (Belum Login) agar fitur "Akun Pemilik" HANYA nampak jika login sebagai sifarofatunnisa24@gmail.com
   const [authSession, setAuthSession] = useState<UserAuthSession>(() => {
-    const saved = localStorage.getItem('sitasi_auth_session');
-    if (saved) {
-      try {
+    try {
+      const saved = localStorage.getItem('sitasi_auth_session');
+      if (saved) {
         const parsed = JSON.parse(saved);
         if (parsed && parsed.role) {
           return parsed;
         }
-      } catch {}
-    }
+      }
+    } catch {}
     return {
       role: 'guest',
       displayName: 'Tamu (Belum Login)',
@@ -234,8 +237,15 @@ export default function App() {
       let loadedSamples: SampleItem[] | null = null;
       let latestUpdatedAt: string | undefined;
 
+      // 0. Ensure runtime Supabase env config is loaded (supports AI Studio Secrets & .env)
+      const configured = await initSupabaseRuntimeConfig();
+      setSupabaseReady(configured);
+      if (configured) {
+        setShowSupabaseConfigBanner(false);
+      }
+
       // 1. Primary Source of Truth: SELECT from Supabase when configured
-      if (isSupabaseConfigured) {
+      if (configured) {
         setSupabaseSyncState('saving');
         const supaRes = await fetchSamplesFromSupabase();
         if (supaRes.success) {
@@ -251,7 +261,7 @@ export default function App() {
         }
       } else {
         setSupabaseSyncState('unconfigured');
-        setSupabaseSyncError(supabaseConfigStatus.errorMessage);
+        setSupabaseSyncError(getSupabaseConfigStatus().errorMessage);
       }
 
       // 2. Fallback to Express server /api/samples if Supabase has 0 rows or is unconfigured/offline
@@ -339,12 +349,13 @@ export default function App() {
 
   // Supabase Realtime Subscription (postgres_changes) + SSE fallback
   useEffect(() => {
-    if (!isSupabaseConfigured || !supabase) return;
+    const client = getSupabaseClient();
+    if (!supabaseReady || !client) return;
 
     let debounceTimer: ReturnType<typeof setTimeout> | null = null;
     let isCleanedUp = false;
 
-    const channel = supabase
+    const channel = client
       .channel('sitasi_samples_realtime_channel')
       .on(
         'postgres_changes',
@@ -378,9 +389,9 @@ export default function App() {
     return () => {
       isCleanedUp = true;
       if (debounceTimer) clearTimeout(debounceTimer);
-      supabase?.removeChannel(channel);
+      client.removeChannel(channel);
     };
-  }, []);
+  }, [supabaseReady]);
 
   // INSTANT REAL-TIME SYNCHRONIZATION VIA SSE (Server-Sent Events)
   useEffect(() => {
@@ -403,7 +414,7 @@ export default function App() {
 
         eventSource.addEventListener('samples_updated', (event: MessageEvent) => {
           // If Supabase is active, Supabase Realtime + manual/auto fetch takes priority
-          if (isSupabaseConfigured) return;
+          if (getIsSupabaseConfigured()) return;
           try {
             const payload = JSON.parse(event.data);
             if (payload && Array.isArray(payload.samples)) {
@@ -457,12 +468,14 @@ export default function App() {
       }
     };
 
-    connectSSE();
+    if (!supabaseReady) {
+      connectSSE();
+    }
 
     // Safety-net periodic check every 15s
     const safetyPollInterval = setInterval(async () => {
       if (unsavedCountRef.current > 0) return;
-      if (isSupabaseConfigured) {
+      if (getIsSupabaseConfigured()) {
         try {
           const supaRes = await fetchSamplesFromSupabase();
           if (supaRes.success && supaRes.data && supaRes.data.length > 0 && !isCleanedUp) {
@@ -520,7 +533,7 @@ export default function App() {
         eventSource.close();
       }
     };
-  }, [showToast]);
+  }, [showToast, supabaseReady]);
 
   // MANUAL SAVE TO SUPABASE & SERVER:
   const handleManualSaveToServer = useCallback(async () => {
@@ -532,14 +545,14 @@ export default function App() {
 
     setIsSavingToServer(true);
     setSyncStatus('saving');
-    if (isSupabaseConfigured) {
+    if (getIsSupabaseConfigured()) {
       setSupabaseSyncState('saving');
       setSupabaseSyncError(null);
     }
 
     try {
       // 1. Sync full dataset to Supabase when configured
-      if (isSupabaseConfigured) {
+      if (getIsSupabaseConfigured()) {
         const supaSaveRes = await upsertSamplesBatchToSupabase(samples);
         if (!supaSaveRes.success) {
           setSupabaseSyncState('error');
@@ -571,7 +584,7 @@ export default function App() {
       });
 
       const json = await res.json();
-      if ((res.ok && json.success) || isSupabaseConfigured) {
+      if ((res.ok && json.success) || getIsSupabaseConfigured()) {
         lastSavedSamplesRef.current = samples;
         setUnsavedCount(0);
         unsavedCountRef.current = 0;
@@ -659,7 +672,7 @@ export default function App() {
     setIsRefreshingSupabase(true);
     setIsSyncingServer(true);
     try {
-      if (isSupabaseConfigured) {
+      if (getIsSupabaseConfigured()) {
         setSupabaseSyncState('saving');
         const supaRes = await fetchSamplesFromSupabase();
         if (!supaRes.success) {
@@ -735,7 +748,7 @@ export default function App() {
       showToast('Belum ada data tersimpan atau Supabase belum dikonfigurasi.', 'info');
     } catch (err: any) {
       console.error('Error refreshing data:', err);
-      if (isSupabaseConfigured) {
+      if (getIsSupabaseConfigured()) {
         setSupabaseSyncState('error');
         setSupabaseSyncError(err?.message || 'Gagal terhubung ke Supabase.');
       }
@@ -749,7 +762,7 @@ export default function App() {
   // Handler untuk Restore Data dari File atau Server Snapshot
   const handleRestoreSamples = useCallback(async (restored: SampleItem[], sourceLabel: string) => {
     try {
-      if (isSupabaseConfigured) {
+      if (getIsSupabaseConfigured()) {
         setSupabaseSyncState('saving');
         const supaRes = await replaceAllSamplesInSupabase(restored);
         if (!supaRes.success) {
@@ -789,7 +802,7 @@ export default function App() {
       setSyncStatus('synced');
       const timeInfo = formatDateTimeZone(new Date());
       setLastSavedAt(timeInfo.displayFull);
-      showToast(`✅ Berhasil merestore ${restored.length} sampel dari "${sourceLabel}" & disinkronkan ke ${isSupabaseConfigured ? 'Supabase' : 'server'} (${timeInfo.displayFull}).`, 'success');
+      showToast(`✅ Berhasil merestore ${restored.length} sampel dari "${sourceLabel}" & disinkronkan ke ${getIsSupabaseConfigured() ? 'Supabase' : 'server'} (${timeInfo.displayFull}).`, 'success');
       return true;
     } catch (err) {
       console.error('Error restoring samples:', err);
@@ -817,7 +830,7 @@ export default function App() {
       const changedRows = updated.filter(s => prevMap.get(s.id) !== s);
       const deletedIds = options?.deletedIds || [];
 
-      if (isSupabaseConfigured && !options?.skipAutoSupabase && (changedRows.length > 0 || deletedIds.length > 0)) {
+      if (getIsSupabaseConfigured() && !options?.skipAutoSupabase && (changedRows.length > 0 || deletedIds.length > 0)) {
         setSupabaseSyncState('saving');
         setSupabaseSyncError(null);
 
@@ -871,7 +884,7 @@ export default function App() {
       setUnsavedCount(diffs);
       unsavedCountRef.current = diffs;
       if (toastMsg) {
-        showToast(`${toastMsg}${isSupabaseConfigured ? '' : " (Klik 'Simpan Perubahan' untuk simpan ke server)"}`, 'info');
+        showToast(`${toastMsg}${getIsSupabaseConfigured() ? '' : " (Klik 'Simpan Perubahan' untuk simpan ke server)"}`, 'info');
       }
     },
     [calculateUnsavedCount, showToast]
@@ -879,33 +892,43 @@ export default function App() {
 
   // Auth & Permissions Handlers
   const handleLoginAccess = async (keyOrPin: string, email?: string) => {
-    try {
-      const res = await fetch('/api/permissions/verify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ keyOrPin, email }),
-      });
-      const json = await res.json();
-      if (json.success) {
-        const isOwnerRole = json.role === 'owner';
-        const session: UserAuthSession = {
-          role: json.role,
-          email: json.email || email,
-          displayName: json.displayName || (isOwnerRole ? 'Pemilik (sifarofatunnisa24@gmail.com)' : (json.email || email || 'Pengguna Google')),
-          token: json.token,
-          canEdit: isOwnerRole || json.role === 'editor',
-          loginAt: new Date().toISOString(),
-        };
-        setAuthSession(session);
-        localStorage.setItem('sitasi_auth_session', JSON.stringify(session));
-        showToast(json.message || 'Login berhasil!', 'success');
-        return { success: true, message: json.message };
-      } else {
-        return { success: false, message: json.error || json.message || 'Gagal login akun Google.' };
-      }
-    } catch {
-      return { success: false, message: 'Gagal menghubungi server autentikasi' };
+    const res = await postJsonWithRetry('/api/permissions/verify', { keyOrPin, email }, { retries: 2, timeoutMs: 10000 });
+    const json = res.data;
+
+    if (!json) {
+      return {
+        success: false,
+        message: res.networkError
+          ? `Gagal menghubungi server autentikasi (${res.networkError})`
+          : 'Gagal menghubungi server autentikasi.',
+      };
     }
+
+    if (json.success) {
+      const isOwnerRole = json.role === 'owner';
+      const session: UserAuthSession = {
+        role: json.role,
+        email: json.email || email,
+        displayName: json.displayName || (isOwnerRole ? 'Pemilik (sifarofatunnisa24@gmail.com)' : (json.email || email || 'Pengguna Google')),
+        token: json.token,
+        canEdit: isOwnerRole || json.role === 'editor',
+        loginAt: new Date().toISOString(),
+      };
+      setAuthSession(session);
+      try {
+        localStorage.setItem('sitasi_auth_session', JSON.stringify(session));
+      } catch {
+        // If localStorage quota is full from large sample cache, clear sample cache and retry persisting auth session
+        try {
+          localStorage.removeItem('sitasi_2026_monitoring_samples_v1');
+          localStorage.setItem('sitasi_auth_session', JSON.stringify(session));
+        } catch {}
+      }
+      showToast(json.message || 'Login berhasil!', 'success');
+      return { success: true, message: json.message };
+    }
+
+    return { success: false, message: json.error || json.message || 'Gagal login akun Google.' };
   };
 
   const handleLogoutAccess = () => {
@@ -915,7 +938,9 @@ export default function App() {
       canEdit: false,
     };
     setAuthSession(guestSession);
-    localStorage.removeItem('sitasi_auth_session');
+    try {
+      localStorage.removeItem('sitasi_auth_session');
+    } catch {}
     setIsAccessModalOpen(false);
     showToast('Berhasil keluar. Fitur Akun Pemilik dinonaktifkan.', 'info');
   };
@@ -932,27 +957,29 @@ export default function App() {
     allowedEmails?: string[];
     allowedPetugas?: string[];
   }) => {
-    try {
-      const res = await fetch('/api/permissions/update', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...updated,
-          role: authSession.role,
-          token: authSession.token,
-        }),
-      });
-      const json = await res.json();
-      if (json.success) {
-        setPermissionConfig(json.data || json.config);
-        showToast('Pengaturan hak akses berhasil diperbarui!', 'success');
-        return { success: true, message: json.message };
-      } else {
-        return { success: false, message: json.error || json.message || 'Gagal memperbarui izin' };
-      }
-    } catch {
-      return { success: false, message: 'Gagal menghubungi server pengaturan izin' };
+    const res = await postJsonWithRetry('/api/permissions/update', {
+      ...updated,
+      role: authSession.role,
+      token: authSession.token,
+    });
+    const json = res.data;
+
+    if (!json) {
+      return {
+        success: false,
+        message: res.networkError
+          ? `Gagal menghubungi server pengaturan izin (${res.networkError})`
+          : 'Gagal menghubungi server pengaturan izin.',
+      };
     }
+
+    if (json.success) {
+      setPermissionConfig(json.data || json.config);
+      showToast('Pengaturan hak akses berhasil diperbarui!', 'success');
+      return { success: true, message: json.message };
+    }
+
+    return { success: false, message: json.error || json.message || 'Gagal memperbarui izin' };
   };
 
 
@@ -1363,7 +1390,7 @@ export default function App() {
         const rows = parseCSV(text);
         const parsed = parseSitasiData(rows, 'Erika');
 
-        if (isSupabaseConfigured) {
+        if (getIsSupabaseConfigured()) {
           setSupabaseSyncState('saving');
           const supaRes = await replaceAllSamplesInSupabase(parsed);
           if (!supaRes.success) {
@@ -1398,7 +1425,7 @@ export default function App() {
           },
           body: JSON.stringify({ samples: parsed, role: authSession.role, token: authSession.token, email: authSession.email }),
         }).catch(() => {});
-        showToast(`Data berhasil dikembalikan ke sampel default Erika dan disinkronkan ke ${isSupabaseConfigured ? 'Supabase' : 'server'}.`, 'info');
+        showToast(`Data berhasil dikembalikan ke sampel default Erika dan disinkronkan ke ${getIsSupabaseConfigured() ? 'Supabase' : 'server'}.`, 'info');
       } catch (err) {
         console.error('Reset error:', err);
       } finally {
@@ -1664,13 +1691,13 @@ export default function App() {
       }`}>
         
         {/* Clear Notification if Supabase env vars are missing */}
-        {!isSupabaseConfigured && showSupabaseConfigBanner && (
+        {!getIsSupabaseConfigured() && showSupabaseConfigBanner && (
           <div className="bg-amber-50 border border-amber-300 text-amber-950 px-4 py-3 rounded-xl flex items-start justify-between gap-3 text-xs shadow-xs">
             <div className="flex items-start space-x-3">
               <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
               <div className="space-y-1">
                 <p className="font-bold text-amber-950">
-                  Konfigurasi Supabase Belum Lengkap ({supabaseConfigStatus.errorMessage})
+                  Konfigurasi Supabase Belum Lengkap ({getSupabaseConfigStatus().errorMessage})
                 </p>
                 <p className="text-amber-900 leading-relaxed">
                   Untuk mengaktifkan database utama Supabase secara permanen: tambahkan <code className="bg-amber-100 px-1 py-0.5 rounded font-mono">VITE_SUPABASE_URL</code> dan <code className="bg-amber-100 px-1 py-0.5 rounded font-mono">VITE_SUPABASE_ANON_KEY</code> pada environment variables / Secrets, lalu jalankan skrip <code className="bg-amber-100 px-1 py-0.5 rounded font-mono">supabase_schema.sql</code> di SQL Editor Supabase. Dashboard tetap berjalan aman menggunakan penyimpanan cadangan lokal/server.
@@ -1689,7 +1716,7 @@ export default function App() {
         )}
 
         {/* Clear Notification if Supabase Query/Sync Failed */}
-        {isSupabaseConfigured && supabaseSyncState === 'error' && supabaseSyncError && (
+        {getIsSupabaseConfigured() && supabaseSyncState === 'error' && supabaseSyncError && (
           <div className="bg-rose-50 border border-rose-300 text-rose-950 px-4 py-3 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs shadow-xs">
             <div className="flex items-start space-x-2.5 max-w-3xl">
               <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
@@ -1715,7 +1742,7 @@ export default function App() {
             <div className="w-10 h-10 border-4 border-emerald-500 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
             <h3 className="text-base font-bold text-slate-800">Memuat Data Sampel SITASI 2026...</h3>
             <p className="text-xs text-slate-500 mt-1">
-              {isSupabaseConfigured
+              {getIsSupabaseConfigured()
                 ? 'Mengambil data terbaru langsung dari database Supabase...'
                 : 'Menguraikan sampel UTP Kubu Raya, koordinat lokasi, dan status lapangan...'}
             </p>
@@ -1747,7 +1774,7 @@ export default function App() {
                     <span className="text-amber-800 font-bold">
                       ⚠️ Ada {unsavedCount} perubahan belum disimpan! (Klik tombol "Simpan Perubahan" di bawah)
                     </span>
-                  ) : isSupabaseConfigured ? (
+                  ) : getIsSupabaseConfigured() ? (
                     '🟢 Tersinkron ke Supabase'
                   ) : syncStatus === 'synced' ? (
                     '🟢 Seluruh data tersimpan di server lokal'

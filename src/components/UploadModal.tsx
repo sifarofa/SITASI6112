@@ -24,8 +24,8 @@ import {
   extractPetugasFromFilename 
 } from '../utils/csvParser';
 import {
-  isSupabaseConfigured,
-  supabaseConfigStatus,
+  getIsSupabaseConfigured,
+  getSupabaseConfigStatus,
   upsertSamplesBatchToSupabase,
   replaceAllSamplesInSupabase,
   deduplicateSamplesForUpsert,
@@ -225,7 +225,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
 
     const dedupedSamples = deduplicateSamplesForUpsert(combinedSamples);
 
-    if (isSupabaseConfigured) {
+    if (getIsSupabaseConfigured()) {
       setIsSyncingSupabase(true);
       setSyncProgress({
         currentBatch: 0,
@@ -339,7 +339,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
           </div>
 
           {/* Supabase Connection Status Notice */}
-          {isSupabaseConfigured ? (
+          {getIsSupabaseConfigured() ? (
             <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-xs text-emerald-900 flex items-start space-x-2.5">
               <Database className="w-4 h-4 text-emerald-600 mt-0.5 shrink-0" />
               <div>
@@ -350,7 +350,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
             <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-900 flex items-start space-x-2.5">
               <AlertTriangle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
               <div>
-                <span className="font-bold">Supabase Belum Dikonfigurasi:</span> {supabaseConfigStatus.errorMessage} File tetap dapat diimpor ke dashboard lokal, namun tidak akan tersinkronisasi ke database Supabase sampai <code>VITE_SUPABASE_URL</code> dan <code>VITE_SUPABASE_ANON_KEY</code> diatur.
+                <span className="font-bold">Supabase Belum Dikonfigurasi:</span> {getSupabaseConfigStatus().errorMessage} File tetap dapat diimpor ke dashboard lokal, namun tidak akan tersinkronisasi ke database Supabase sampai <code>VITE_SUPABASE_URL</code> dan <code>VITE_SUPABASE_ANON_KEY</code> diatur.
               </div>
             </div>
           )}
@@ -595,7 +595,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
               <span>
                 {isSyncingSupabase
                   ? 'Menyinkronkan ke Supabase...'
-                  : isSupabaseConfigured
+                  : getIsSupabaseConfigured()
                   ? `Impor & Sinkronkan ${totalCombinedSamples} Sampel`
                   : `Impor ${totalCombinedSamples} Sampel (${validFiles.length} File)`}
               </span>

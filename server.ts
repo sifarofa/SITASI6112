@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import fs from 'fs';
@@ -17,7 +18,13 @@ async function startServer() {
   app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', '*');
+    const reqHeaders = req.headers['access-control-request-headers'];
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      typeof reqHeaders === 'string' && reqHeaders.trim()
+        ? reqHeaders
+        : 'Content-Type, Authorization, Accept, X-Auth-Role, X-Auth-Token, X-Auth-Key, X-Auth-Email, Cache-Control, Pragma'
+    );
     if (req.method === 'OPTIONS') {
       return res.sendStatus(200);
     }
@@ -26,6 +33,19 @@ async function startServer() {
 
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+  app.use(express.text({ type: 'text/plain', limit: '50mb' }));
+
+  const parseSafeBody = (rawBody: unknown): Record<string, any> => {
+    if (typeof rawBody === 'string') {
+      try {
+        const parsed = JSON.parse(rawBody);
+        return parsed && typeof parsed === 'object' ? parsed : {};
+      } catch {
+        return {};
+      }
+    }
+    return rawBody && typeof rawBody === 'object' ? (rawBody as Record<string, any>) : {};
+  };
 
   // Ensure server data folder exists for persistence across devices
   const DATA_DIR = path.join(__dirname, 'server_data');
@@ -62,7 +82,11 @@ async function startServer() {
         return DEFAULT_PERMISSIONS;
       }
     }
-    fs.writeFileSync(PERMISSIONS_FILE, JSON.stringify(DEFAULT_PERMISSIONS, null, 2), 'utf-8');
+    try {
+      fs.writeFileSync(PERMISSIONS_FILE, JSON.stringify(DEFAULT_PERMISSIONS, null, 2), 'utf-8');
+    } catch (e) {
+      console.warn('[SERVER] Could not write default permissions file:', e);
+    }
     return DEFAULT_PERMISSIONS;
   }
 
@@ -119,6 +143,19 @@ async function startServer() {
   }, 25000);
 
   // API Endpoints
+  // 0. Public Supabase runtime configuration (exposes ONLY public Project URL and public anon key)
+  app.get('/api/supabase-public-config', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    const url = String(process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '').trim();
+    const anonKey = String(process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '').trim();
+    const configured = Boolean(url && anonKey && /^https?:\/\//i.test(url) && anonKey.length >= 16);
+    return res.json({
+      configured,
+      url: configured ? url : '',
+      anonKey: configured ? anonKey : '',
+    });
+  });
+
   // 1. Get Samples (Source of truth across all devices)
   app.get('/api/samples', (req, res) => {
     // Explicitly disallow any browser/proxy/CDN caching for live samples data
@@ -282,8 +319,9 @@ async function startServer() {
 
   // Verify Gmail Account / PIN / Access Key
   app.post('/api/permissions/verify', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     try {
-      const { keyOrPin, email } = req.body;
+      const { keyOrPin, email } = parseSafeBody(req.body);
       const perm = getPermissions();
 
       const trimmedEmail = String(email || '').trim().toLowerCase();
@@ -395,8 +433,9 @@ async function startServer() {
 
   // Update permission settings (Owner only: add/remove allowed emails, change mode)
   app.post('/api/permissions/update', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     try {
-      const { ownerPin, accessMode, accessKey, newOwnerPin, allowedEmails, allowedPetugas } = req.body;
+      const { ownerPin, accessMode, accessKey, newOwnerPin, allowedEmails, allowedPetugas } = parseSafeBody(req.body);
       const perm = getPermissions();
 
       if (String(ownerPin || '').trim() !== perm.ownerPin) {
@@ -437,8 +476,9 @@ async function startServer() {
 
   // 2.5 Change Owner PIN
   app.post('/api/permissions/change-pin', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     try {
-      const { currentPin, newPin } = req.body;
+      const { currentPin, newPin } = parseSafeBody(req.body);
       const perm = getPermissions();
 
       if (!currentPin || String(currentPin).trim() !== perm.ownerPin) {

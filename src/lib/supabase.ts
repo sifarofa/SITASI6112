@@ -8,8 +8,8 @@ import {
 export const SUPABASE_SAMPLES_TABLE = 'sitasi_samples';
 export const SUPABASE_UPSERT_BATCH_SIZE = 500;
 
-const rawUrl = String(import.meta.env.VITE_SUPABASE_URL || '').trim();
-const rawAnonKey = String(import.meta.env.VITE_SUPABASE_ANON_KEY || '').trim();
+const rawEnvUrl = String(import.meta.env.VITE_SUPABASE_URL || '').trim();
+const rawEnvAnonKey = String(import.meta.env.VITE_SUPABASE_ANON_KEY || '').trim();
 
 function isValidHttpUrl(value: string): boolean {
   if (!value) return false;
@@ -28,32 +28,105 @@ function isValidAnonKey(value: string): boolean {
   return value.length >= 16;
 }
 
-const hasValidUrl = isValidHttpUrl(rawUrl);
-const hasValidKey = isValidAnonKey(rawAnonKey);
+function buildConfigErrorMessage(url: string, key: string): string | null {
+  const validUrl = isValidHttpUrl(url);
+  const validKey = isValidAnonKey(key);
+  if (validUrl && validKey) return null;
+  if (!url && !key) {
+    return 'Environment variable VITE_SUPABASE_URL dan VITE_SUPABASE_ANON_KEY belum diisi.';
+  }
+  if (!validUrl) {
+    return 'VITE_SUPABASE_URL belum valid (harus berupa URL https://... proyek Supabase Anda).';
+  }
+  return 'VITE_SUPABASE_ANON_KEY belum diisi atau tidak valid.';
+}
 
-export const isSupabaseConfigured = hasValidUrl && hasValidKey;
+let activeUrl = rawEnvUrl;
+let activeAnonKey = rawEnvAnonKey;
+let runtimeConfigured = isValidHttpUrl(activeUrl) && isValidAnonKey(activeAnonKey);
 
-export const supabaseConfigStatus = {
-  configured: isSupabaseConfigured,
-  hasUrl: hasValidUrl,
-  hasKey: hasValidKey,
-  errorMessage: isSupabaseConfigured
-    ? null
-    : !rawUrl && !rawAnonKey
-    ? 'Environment variable VITE_SUPABASE_URL dan VITE_SUPABASE_ANON_KEY belum diisi.'
-    : !hasValidUrl
-    ? 'VITE_SUPABASE_URL belum valid (harus berupa URL https://... proyek Supabase Anda).'
-    : 'VITE_SUPABASE_ANON_KEY belum diisi atau tidak valid.',
+export let isSupabaseConfigured = runtimeConfigured;
+
+export let supabaseConfigStatus = {
+  configured: runtimeConfigured,
+  hasUrl: isValidHttpUrl(activeUrl),
+  hasKey: isValidAnonKey(activeAnonKey),
+  errorMessage: buildConfigErrorMessage(activeUrl, activeAnonKey),
 };
 
-export const supabase: SupabaseClient | null = isSupabaseConfigured
-  ? createClient(rawUrl, rawAnonKey, {
+let activeClient: SupabaseClient | null = runtimeConfigured
+  ? createClient(activeUrl, activeAnonKey, {
       auth: {
         persistSession: false,
         autoRefreshToken: false,
       },
     })
   : null;
+
+export let supabase: SupabaseClient | null = activeClient;
+
+export function getSupabaseClient(): SupabaseClient | null {
+  return activeClient;
+}
+
+export function getIsSupabaseConfigured(): boolean {
+  return runtimeConfigured && activeClient !== null;
+}
+
+export function getSupabaseConfigStatus() {
+  return {
+    configured: runtimeConfigured,
+    hasUrl: isValidHttpUrl(activeUrl),
+    hasKey: isValidAnonKey(activeAnonKey),
+    errorMessage: buildConfigErrorMessage(activeUrl, activeAnonKey),
+  };
+}
+
+/**
+ * Fallback runtime configuration loader:
+ * Jika VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY ditambahkan melalui panel Secrets atau .env
+ * setelah Vite build, aplikasi tetap dapat mengambil konfigurasi publik secara runtime dari server.
+ */
+export async function initSupabaseRuntimeConfig(): Promise<boolean> {
+  if (runtimeConfigured && activeClient) {
+    return true;
+  }
+
+  try {
+    const res = await fetch(`/api/supabase-public-config?_t=${Date.now()}`, {
+      cache: 'no-store',
+    });
+    if (!res.ok) return false;
+    const json = await res.json();
+    const url = String(json?.url || '').trim();
+    const anonKey = String(json?.anonKey || '').trim();
+
+    if (json?.configured && isValidHttpUrl(url) && isValidAnonKey(anonKey)) {
+      activeUrl = url;
+      activeAnonKey = anonKey;
+      runtimeConfigured = true;
+      activeClient = createClient(url, anonKey, {
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false,
+        },
+      });
+      supabase = activeClient;
+      isSupabaseConfigured = true;
+      supabaseConfigStatus = {
+        configured: true,
+        hasUrl: true,
+        hasKey: true,
+        errorMessage: null,
+      };
+      return true;
+    }
+  } catch {
+    // Ignore network errors during runtime config probe
+  }
+
+  return false;
+}
 
 export interface SitasiSampleRow {
   id: string;
@@ -271,10 +344,11 @@ export function deduplicateSamplesForUpsert(samples: SampleItem[]): SampleItem[]
  * Fetch all samples from Supabase (handles >1000 rows via paged SELECT queries)
  */
 export async function fetchSamplesFromSupabase(): Promise<SupabaseSyncResult<SampleItem[]>> {
-  if (!supabase) {
+  const client = getSupabaseClient();
+  if (!client) {
     return {
       success: false,
-      error: supabaseConfigStatus.errorMessage || 'Supabase belum dikonfigurasi.',
+      error: getSupabaseConfigStatus().errorMessage || 'Supabase belum dikonfigurasi.',
     };
   }
 
@@ -284,7 +358,7 @@ export async function fetchSamplesFromSupabase(): Promise<SupabaseSyncResult<Sam
     let from = 0;
 
     while (true) {
-      const { data, error } = await supabase
+      const { data, error } = await client
         .from(SUPABASE_SAMPLES_TABLE)
         .select('*')
         .order('nks', { ascending: true })
@@ -349,10 +423,11 @@ export async function upsertSamplesBatchToSupabase(
   samples: SampleItem[],
   onProgress?: (progress: SupabaseSyncProgress) => void
 ): Promise<SupabaseSyncResult<SampleItem[]>> {
-  if (!supabase) {
+  const client = getSupabaseClient();
+  if (!client) {
     return {
       success: false,
-      error: supabaseConfigStatus.errorMessage || 'Supabase belum dikonfigurasi.',
+      error: getSupabaseConfigStatus().errorMessage || 'Supabase belum dikonfigurasi.',
     };
   }
 
@@ -377,7 +452,7 @@ export async function upsertSamplesBatchToSupabase(
       const chunk = deduped.slice(start, start + SUPABASE_UPSERT_BATCH_SIZE);
       const rows = chunk.map(mapSampleToRow);
 
-      const { error } = await supabase
+      const { error } = await client
         .from(SUPABASE_SAMPLES_TABLE)
         .upsert(rows, { onConflict: 'id' });
 
@@ -428,10 +503,11 @@ export async function upsertSamplesBatchToSupabase(
 export async function deleteSamplesFromSupabase(
   ids: string[]
 ): Promise<SupabaseSyncResult<number>> {
-  if (!supabase) {
+  const client = getSupabaseClient();
+  if (!client) {
     return {
       success: false,
-      error: supabaseConfigStatus.errorMessage || 'Supabase belum dikonfigurasi.',
+      error: getSupabaseConfigStatus().errorMessage || 'Supabase belum dikonfigurasi.',
     };
   }
 
@@ -443,7 +519,7 @@ export async function deleteSamplesFromSupabase(
   try {
     for (let i = 0; i < cleanIds.length; i += SUPABASE_UPSERT_BATCH_SIZE) {
       const chunk = cleanIds.slice(i, i + SUPABASE_UPSERT_BATCH_SIZE);
-      const { error } = await supabase
+      const { error } = await client
         .from(SUPABASE_SAMPLES_TABLE)
         .delete()
         .in('id', chunk);
@@ -485,10 +561,11 @@ export async function replaceAllSamplesInSupabase(
   samples: SampleItem[],
   onProgress?: (progress: SupabaseSyncProgress) => void
 ): Promise<SupabaseSyncResult<SampleItem[]>> {
-  if (!supabase) {
+  const client = getSupabaseClient();
+  if (!client) {
     return {
       success: false,
-      error: supabaseConfigStatus.errorMessage || 'Supabase belum dikonfigurasi.',
+      error: getSupabaseConfigStatus().errorMessage || 'Supabase belum dikonfigurasi.',
     };
   }
 
@@ -496,13 +573,12 @@ export async function replaceAllSamplesInSupabase(
     const deduped = deduplicateSamplesForUpsert(samples);
     const incomingIdSet = new Set(deduped.map(s => s.id));
 
-    // Fetch existing IDs so we remove any stale records safely
     const PAGE_SIZE = 1000;
     const staleIds: string[] = [];
     let from = 0;
 
     while (true) {
-      const { data, error } = await supabase
+      const { data, error } = await client
         .from(SUPABASE_SAMPLES_TABLE)
         .select('id')
         .range(from, from + PAGE_SIZE - 1);

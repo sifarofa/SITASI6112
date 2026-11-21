@@ -22,6 +22,7 @@ import {
   UserX
 } from 'lucide-react';
 import { UserRole, PermissionConfig, UserAuthSession } from '../types/sitasi';
+import { postJsonWithRetry } from '../utils/api';
 
 interface AccessControlModalProps {
   isOpen: boolean;
@@ -197,23 +198,26 @@ export const AccessControlModal: React.FC<AccessControlModalProps> = ({
 
     setIsChangingPin(true);
     try {
-      const res = await fetch('/api/permissions/change-pin', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          currentPin: pinChangeCurrent.trim(),
-          newPin: pinChangeNew.trim(),
-        }),
+      const res = await postJsonWithRetry('/api/permissions/change-pin', {
+        currentPin: pinChangeCurrent.trim(),
+        newPin: pinChangeNew.trim(),
       });
-      const json = await res.json();
-      if (res.ok && json.success) {
+      const json = res.data;
+      if (res.ok && json?.success) {
         showToast('✅ Berhasil! PIN/Password Pemilik telah diperbarui.', 'success');
         setPinChangeCurrent('');
         setPinChangeNew('');
         setPinChangeConfirm('');
         setActiveTab('manage');
+      } else if (!json) {
+        showToast(
+          res.networkError
+            ? `Gagal menghubungi server untuk mengubah PIN (${res.networkError}).`
+            : 'Gagal menghubungi server untuk mengubah PIN.',
+          'error'
+        );
       } else {
-        showToast(json.message || 'Gagal mengubah PIN Pemilik. Pastikan PIN saat ini benar.', 'error');
+        showToast(json.error || json.message || 'Gagal mengubah PIN Pemilik. Pastikan PIN saat ini benar.', 'error');
       }
     } catch {
       showToast('Gagal menghubungi server untuk mengubah PIN.', 'error');
